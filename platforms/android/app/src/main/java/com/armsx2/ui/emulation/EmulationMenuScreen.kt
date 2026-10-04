@@ -516,7 +516,7 @@ private fun MenuTab(tab: EmulationMenuTab, active: Boolean, onSelect: (Emulation
 }
 
 // Rail tab icons. No monochrome Unicode exists for gamepad/wrench/trophy/display, so those
-// use color emoji (the bundled NotoColorEmoji renders them); Session keeps its clean text
+// use color emoji (Android's own emoji font draws them); Session keeps its clean text
 // glyph. Performance uses the high-voltage emoji so it reads as a yellow lightning bolt.
 // Options carries the settings gear; the full-settings shortcut below the rail divider uses
 // a distinct "open" glyph so there aren't two gears.
@@ -666,6 +666,7 @@ private fun SessionPane(state: EmulationMenuUiState, viewModel: EmulationMenuVie
                 android.widget.Toast.makeText(context, gsDumpQueued, android.widget.Toast.LENGTH_LONG).show()
                 viewModel.resume()
             },
+        ) + arcadeActions(viewModel) + listOf(
             MenuAction(str("action.close"), MainActivityRuntime.currentGame.value?.title.orEmpty(), "■", Danger) {
                 MainActivityRuntime.closeGame()
             },
@@ -1576,6 +1577,33 @@ private fun HardcoreBadge() {
     }
 }
 
+/**
+ * The arcade cabinet's own buttons, while an arcade game runs: coins, Service and the Test switch.
+ * Each goes back to the game, which only sees a press it is running for.
+ */
+@Composable
+private fun arcadeActions(viewModel: EmulationMenuViewModel): List<MenuAction> {
+    if (com.armsx2.arcade.Arcade.sessionMode.intValue < 0) return emptyList()
+    return listOf(
+        MenuAction(str("arcade.coin.p1"), str("arcade.coin.p1.detail"), "¢", null) {
+            com.armsx2.arcade.Arcade.insertCoin(0)
+            viewModel.resume()
+        },
+        MenuAction(str("arcade.coin.p2"), str("arcade.coin.p2.detail"), "¢", null) {
+            com.armsx2.arcade.Arcade.insertCoin(1)
+            viewModel.resume()
+        },
+        MenuAction(str("arcade.service"), str("arcade.service.detail"), "✚", null) {
+            viewModel.resume()
+            com.armsx2.arcade.Arcade.pressService()
+        },
+        MenuAction(str("arcade.test"), str("arcade.test.detail"), "⚙", null) {
+            com.armsx2.arcade.Arcade.toggleTest()
+            viewModel.resume()
+        },
+    )
+}
+
 private data class MenuAction(
     val title: String,
     val detail: String,
@@ -1756,8 +1784,6 @@ private fun MenuSwitchRow(
             .controllerFocusable(
                 "pause.switch.$title",
                 onConfirm = { if (enabled) onCheckedChange(!checked) },
-                onLeft = { if (enabled) onCheckedChange(false) },
-                onRight = { if (enabled) onCheckedChange(true) },
             ),
         enabled = enabled,
         shape = RoundedCornerShape(16.dp),
