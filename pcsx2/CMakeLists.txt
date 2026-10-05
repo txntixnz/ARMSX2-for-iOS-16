@@ -375,6 +375,7 @@ set(pcsx2DEV9Headers
 	DEV9/ACATA_CMD_RESPONSES
 	DEV9/ACATA_internal.h
 	DEV9/ACATA_IO_CHD.h
+	DEV9/ACATA_IO_WRITES.h
 	DEV9/ACATAPI.h
 	DEV9/ACCORE.h
 	DEV9/ACDEV.h
@@ -646,6 +647,7 @@ set(pcsx2GSHeaders
 	GS/Renderers/Common/GSDirtyRect.h
 	GS/Renderers/Common/GSDrawRoad.h
 	GS/Renderers/Common/GSFastList.h
+	GS/Renderers/Common/GSAlphaBitLogicOp.h
 	GS/Renderers/Common/GSFastStencilShadow.h
 	GS/Renderers/Common/GSFieldShiftDetector.h
 	GS/Renderers/Common/GSFieldShiftPolicy.h

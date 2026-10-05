@@ -78,6 +78,7 @@
 #include <thread>
 #include <regex>
 #include <tuple>
+#include <map>
 #include <vector>
 
 
@@ -1120,7 +1121,8 @@ static GenericInputBinding PadKeyToGeneric(jint key) {
 //   D-pad, and the left stick past half way: the lever.
 //   Square, Triangle, L1, Cross, Circle, R1: buttons 1 to 6, unless the game has a table of its own
 //     (fighting, racing and quiz games), which then says which button is which.
-//   Racing: the left stick steers, R2 accelerates, L2 brakes, the D-pad works the menus.
+//   Racing: the left stick steers, R2 accelerates, L2 brakes, the D-pad works the menus, and Square or
+//     Cross (button 1) or Circle (button 5) enters them, where the game's racing controls leave those free.
 //   Twin levers (Zoids): the sticks are the levers, L2/R2 the triggers, L1/R1 the buttons.
 //   Drums (Taiko): the D-pad hits the left half of the drum face (Don), the face buttons the right
 //     half, L1/L2 the left rim (Ka), R1/R2 the right rim.
@@ -1143,6 +1145,11 @@ namespace
 		bool touch_offscreen = false; // a touch fired beside the screen
 	};
 	ArcadePad s_arcade_pad[2];
+
+	// The player's own layout for this arcade game (the Arcade controls settings, NativeApp.setArcadeRemap):
+	// a pad key -> the pad key whose job it does there, -1 for none. A key not in it keeps its own job.
+	// Pad keycodes, as applyPadButton's. Under s_pad_mutex.
+	std::map<jint, jint> s_arcade_remap;
 
 	// GunCon 2 bind indices (usb-lightgun/guncon2.cpp), which the touch gun layer sends.
 	enum : jint
@@ -1278,6 +1285,25 @@ static void ArcadeApplyPad(u32 player) {
 			bits |= lever(false) | (buttons.empty() ? six_buttons() : table(buttons));
 			if (ArcadeHeld(p, GIB::Start))
 				bits |= JVS_BTN_START;
+			// A test menu's ENTER switch is a cabinet button no racing control uses: in Ace Driver 3 the
+			// lever moves the highlight, and neither Start nor View enters. So the face buttons the game's
+			// racing table leaves free work the cabinet's free buttons: Square and Cross button 1 (Ridge
+			// Racer V's board takes ENTER from Square in PCSX2x6), Circle button 5.
+			if (!buttons.empty())
+			{
+				u16 taken = 0;
+				for (const InputBindingInfo& bi : buttons)
+					taken |= static_cast<u16>(bi.bind_index);
+				const auto free_button = [&](GIB pad, u16 bit) {
+					const bool used = std::any_of(buttons.begin(), buttons.end(),
+						[pad](const InputBindingInfo& bi) { return bi.generic_mapping == pad; });
+					if (!used && !(taken & bit) && ArcadeHeld(p, pad))
+						bits |= bit;
+				};
+				free_button(GIB::Square, JVS_BTN_1);
+				free_button(GIB::Cross, JVS_BTN_1);
+				free_button(GIB::Circle, JVS_BTN_5);
+			}
 		}
 		break;
 
@@ -1350,7 +1376,11 @@ static void ArcadePadEvent(u32 player, jint key, float state) {
 		case 105: p.r2 = state; break;
 		default: break;
 	}
-	const GenericInputBinding generic = PadKeyToGeneric(key);
+	// The button's job in the player's layout for this game; the analog values above (sticks, pedals)
+	// stay with the keys they come from.
+	const auto remapped = s_arcade_remap.find(key);
+	const jint job = (remapped != s_arcade_remap.end()) ? remapped->second : key;
+	const GenericInputBinding generic = (job < 0) ? GenericInputBinding::Unknown : PadKeyToGeneric(job);
 	if (generic != GenericInputBinding::Unknown)
 	{
 		bool& down = p.down[static_cast<size_t>(generic)];
@@ -2748,6 +2778,206 @@ Java_kr_co_iefriends_pcsx2_NativeApp_arcadeTestModeOn(JNIEnv*, jclass) {
     return (VMManager::HasValidVM() && Arcade::IsActive() && ACJV::GetDIPSwitchState(0)) ? JNI_TRUE : JNI_FALSE;
 }
 
+// ---- The Arcade controls settings --------------------------------------------------------------------
+
+/// The pad key a generic binding stands for (PadKeyToGeneric backwards), or -1.
+static jint GenericToPadKey(GenericInputBinding b) {
+    switch (b) {
+        case GenericInputBinding::DPadUp:    return 19;
+        case GenericInputBinding::DPadRight: return 22;
+        case GenericInputBinding::DPadDown:  return 20;
+        case GenericInputBinding::DPadLeft:  return 21;
+        case GenericInputBinding::Triangle:  return 100;
+        case GenericInputBinding::Circle:    return 97;
+        case GenericInputBinding::Cross:     return 96;
+        case GenericInputBinding::Square:    return 99;
+        case GenericInputBinding::Select:    return 109;
+        case GenericInputBinding::Start:     return 108;
+        case GenericInputBinding::L1:        return 102;
+        case GenericInputBinding::L2:        return 104;
+        case GenericInputBinding::R1:        return 103;
+        case GenericInputBinding::R2:        return 105;
+        case GenericInputBinding::L3:        return 106;
+        case GenericInputBinding::R3:        return 107;
+        default:                             return -1;
+    }
+}
+
+namespace
+{
+	// A job the pad's buttons do on an arcade cabinet, as the Arcade controls settings list it: its name
+	// ("@" and an app string key, or the cabinet's own label) and the pad keys doing it by default, the
+	// first standing in for the job when another button is given it. A fixed job is an analog pedal's.
+	struct ArcadeJob
+	{
+		std::string label;
+		std::vector<jint> keys;
+		bool fixed = false;
+	};
+} // namespace
+
+// The jobs of [gameid]'s cabinet, played in [mode]. Mirrors ArcadeApplyPad: keep the two in step.
+static std::vector<ArcadeJob> ArcadeJobs(const std::string& gameid, JVS_MODE mode) {
+	using GIB = GenericInputBinding;
+	std::vector<ArcadeJob> jobs;
+	const auto add = [&jobs](std::string label, std::vector<jint> keys, bool fixed = false) {
+		if (!keys.empty())
+			jobs.push_back({std::move(label), std::move(keys), fixed});
+	};
+	const auto lever = [&add]() {
+		add("@arcade.ctl.up", {19});
+		add("@arcade.ctl.down", {20});
+		add("@arcade.ctl.left", {21});
+		add("@arcade.ctl.right", {22});
+	};
+	// The cabinet's own name for a button, without the "P1 " the twin-lever table starts with.
+	const auto name = [](const InputBindingInfo& bi) {
+		std::string n = bi.display_name ? bi.display_name : bi.name;
+		if (n.rfind("P1 ", 0) == 0)
+			n.erase(0, 3);
+		return n;
+	};
+	const auto table = [&add, &name](std::span<const InputBindingInfo> buttons, u16 mask = 0xFFFF) {
+		for (const InputBindingInfo& bi : buttons)
+		{
+			const jint key = GenericToPadKey(bi.generic_mapping);
+			if (key >= 0 && (bi.bind_index & mask) != 0)
+				add(name(bi), {key});
+		}
+	};
+	const auto six_buttons = [&add]() {
+		add("@arcade.ctl.button:1", {99});
+		add("@arcade.ctl.button:2", {100});
+		add("@arcade.ctl.button:3", {102});
+		add("@arcade.ctl.button:4", {96});
+		add("@arcade.ctl.button:5", {97});
+		add("@arcade.ctl.button:6", {103});
+	};
+
+	switch (mode)
+	{
+		case JVS_MODE::LIGHTGUN:
+			add("@arcade.ctl.trigger", {105, 96});
+			add("@arcade.ctl.pedal", {102, 104});
+			add("@arcade.ctl.start", {108});
+			break;
+
+		case JVS_MODE::DRIVE:
+		{
+			const std::span<const InputBindingInfo> buttons = ACJV::GetRacingButtons(gameid);
+			lever();
+			if (buttons.empty())
+			{
+				six_buttons();
+			}
+			else
+			{
+				table(buttons);
+				// The face buttons the racing controls leave free work the cabinet's free buttons 1 and 5.
+				u16 taken = 0;
+				for (const InputBindingInfo& bi : buttons)
+					taken |= static_cast<u16>(bi.bind_index);
+				const auto free = [&buttons, taken](GIB pad, u16 bit) {
+					return !(taken & bit) && std::none_of(buttons.begin(), buttons.end(),
+						[pad](const InputBindingInfo& bi) { return bi.generic_mapping == pad; });
+				};
+				std::vector<jint> one;
+				if (free(GIB::Square, JVS_BTN_1))
+					one.push_back(99);
+				if (free(GIB::Cross, JVS_BTN_1))
+					one.push_back(96);
+				add("@arcade.ctl.button:1", std::move(one));
+				if (free(GIB::Circle, JVS_BTN_5))
+					add("@arcade.ctl.button:5", {97});
+			}
+			add("@arcade.ctl.start", {108});
+			add("@arcade.ctl.gas", {105}, true);
+			add("@arcade.ctl.brake", {104}, true);
+		}
+		break;
+
+		case JVS_MODE::DRUM:
+			add("@arcade.ctl.donLeft", {19, 20, 21, 22});
+			add("@arcade.ctl.donRight", {96, 97, 99, 100});
+			add("@arcade.ctl.kaLeft", {102, 104});
+			add("@arcade.ctl.kaRight", {103, 105});
+			add("@arcade.ctl.start", {108});
+			break;
+
+		case JVS_MODE::TWINSTICK:
+			lever();
+			table(ACJV::GetTwinstickBindings(), static_cast<u16>(0x0400 | 0x1000 | 0x0200 | 0x0800 | JVS_BTN_START));
+			break;
+
+		default: // fighting, standard, touch panel and unknown games
+		{
+			std::span<const InputBindingInfo> buttons;
+			if (mode == JVS_MODE::FIGHTING)
+				buttons = ACJV::GetFightingButtons(gameid);
+			else if (mode == JVS_MODE::STANDARD)
+				buttons = ACJV::GetStandardButtons(gameid);
+			lever();
+			if (buttons.empty())
+				six_buttons();
+			else
+				table(buttons);
+			add("@arcade.ctl.start", {108});
+		}
+		break;
+	}
+	add("@arcade.ctl.coin", {109});
+	return jobs;
+}
+
+/// The jobs the pad's buttons do on [gameId]'s cabinet, for the Arcade controls settings: "mode\t<n>" first,
+/// then a job a line, tab separated: its name ("@" and an app string key, or the cabinet's own label), the
+/// pad keys doing it by default (comma separated), and 1 for a fixed one (an analog pedal). The running
+/// game's mode is the one it was started in.
+extern "C"
+JNIEXPORT jstring JNICALL
+Java_kr_co_iefriends_pcsx2_NativeApp_getArcadeControls(JNIEnv* env, jclass, jstring gameId) {
+    const std::string id = gameId ? GetJavaString(env, gameId) : std::string();
+    const JVS_MODE mode = (Arcade::IsActive() && ACJV::GetGameId() == id) ? ACJV::GetMode() : ACJV::ResolveModeFromGameId(id);
+    std::string out = "mode\t" + std::to_string(static_cast<int>(mode)) + "\n";
+    for (const ArcadeJob& job : ArcadeJobs(id, mode)) {
+        out += job.label;
+        out += '\t';
+        for (size_t i = 0; i < job.keys.size(); i++) {
+            if (i)
+                out += ',';
+            out += std::to_string(job.keys[i]);
+        }
+        out += job.fixed ? "\t1\n" : "\t0\n";
+    }
+    return env->NewStringUTF(out.c_str());
+}
+
+/// The player's own layout for the arcade game being played: pairs of pad keys (a button, then the button
+/// whose job it does, -1 for none); every other button keeps its own job. Empty: the cabinet's own layout.
+/// What is held is let go, as it was held under the old layout.
+extern "C"
+JNIEXPORT void JNICALL
+Java_kr_co_iefriends_pcsx2_NativeApp_setArcadeRemap(JNIEnv* env, jclass, jintArray pairs) {
+    std::vector<jint> v;
+    if (pairs) {
+        v.resize(static_cast<size_t>(env->GetArrayLength(pairs)));
+        if (!v.empty())
+            env->GetIntArrayRegion(pairs, 0, static_cast<jsize>(v.size()), v.data());
+    }
+    std::lock_guard<std::mutex> lk(s_pad_mutex);
+    s_arcade_remap.clear();
+    for (size_t i = 0; i + 1 < v.size(); i += 2) {
+        if (v[i] != v[i + 1])
+            s_arcade_remap[v[i]] = v[i + 1];
+    }
+    const bool live = VMManager::HasValidVM() && Arcade::IsActive();
+    for (u32 player = 0; player < 2; player++) {
+        std::fill(std::begin(s_arcade_pad[player].down), std::end(s_arcade_pad[player].down), false);
+        if (live)
+            ArcadeApplyPad(player);
+    }
+}
+
 /// Every arcade game the database knows, one per line: game ID, name, board (System246, System256 or
 /// System SUPER256) and media (CD, DVD or HDD), tab separated. For the arcade screen's import list.
 extern "C"
@@ -2783,6 +3013,18 @@ Java_kr_co_iefriends_pcsx2_NativeApp_isArcadeBios(JNIEnv* env, jclass, jstring p
     u32 version, region;
     std::string description, zone;
     return (IsBIOS(p.c_str(), version, description, region, zone) && zone == "COH-H") ? JNI_TRUE : JNI_FALSE;
+}
+
+/// The board whose BIOS an arcade game needs when none of the arcade BIOS files in the BIOS folder runs it
+/// ("System 246" for Battle Gear 3, which rejects the System 256 one), else "" (one does, or there is no
+/// arcade BIOS at all, which isArcadeBios tells). The same choice the core makes at boot (FindArcadeBiosFor).
+extern "C"
+JNIEXPORT jstring JNICALL
+Java_kr_co_iefriends_pcsx2_NativeApp_getArcadeBiosNeed(JNIEnv* env, jclass, jstring gameId) {
+    std::string needs;
+    if (gameId)
+        FindArcadeBiosFor(GetJavaString(env, gameId), {}, &needs);
+    return env->NewStringUTF(needs.c_str());
 }
 
 // One-time repair for enable lists poisoned by the old bulk auto-sync.

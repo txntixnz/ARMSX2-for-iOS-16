@@ -37,11 +37,19 @@ object Arcade {
     /** The library badge for an arcade game (GameInfo.extension). */
     const val BADGE = "ARCADE"
 
+    /** The games that start but only reach their attract demo, in PCSX2x6 as here (its compatibility
+     *  list, https://github.com/PS2Homebrew-arcade/pcsx2x6/issues/9): Dragon Chronicle, Dragon Chronicle
+     *  Online and The IDOLM@STER. The NAMCO screen says so instead of "Ready to play". */
+    val ATTRACT_ONLY = setOf("NM00014", "NM00020", "NM00022")
+
     private const val MAX_ACGAME_BYTES = 64 * 1024
     private val GAME_ID = Regex("NM\\d{5}")
 
     /** The running arcade game's controls (NativeApp.ARCADE_MODE_*), or -1 when none is running. */
     val sessionMode = mutableIntStateOf(-1)
+
+    /** The running arcade game's ID, or null when none is running (its Arcade controls in the pause menu). */
+    val sessionGameId = mutableStateOf<String?>(null)
 
     /** A message about the last arcade launch, shown over the library until dismissed. */
     val notice = mutableStateOf<String?>(null)
@@ -65,15 +73,31 @@ object Arcade {
         val jvsMode: String,
     )
 
-    /** What a launch found, to hand to the core (NativeApp.setArcadeLaunchFiles). */
-    data class Launch(val game: AcGame, val elf: String, val media: String, val sram: String, val mode: Int)
+    /** What a launch found, to hand to the core (NativeApp.setArcadeLaunchFiles), and the .acgame it boots
+     *  ([manifest]): the game's own, or the one [prepare] writes for a game kept as its own files. */
+    data class Launch(
+        val game: AcGame,
+        val elf: String,
+        val media: String,
+        val sram: String,
+        val mode: Int,
+        val manifest: String,
+    )
 
     fun isAcGameName(name: String?): Boolean = name?.endsWith(".$EXTENSION", ignoreCase = true) == true
 
     /** Whether a launch is an arcade game: by its name, or, for a document whose URI does not carry
      *  its name, by what the library found it to be. */
     fun isArcadeLaunch(path: String, game: com.armsx2.GameInfo?): Boolean =
-        isAcGameName(path) || game?.extension == BADGE
+        isAcGameName(path) || game?.extension == BADGE || looksLikeArcadeImage(path)
+
+    /** An image named after an arcade game, by its path or a URI that carries its name: a launch the
+     *  library did not make (Recently Played, another app) still goes to the board. */
+    private fun looksLikeArcadeImage(path: String): Boolean {
+        val name = Uri.decode(path).substringAfterLast('/').substringAfterLast(':')
+        return ArcadeFiles.idIn(name) != null &&
+            ArcadeFiles.kindOf(name) { ArcadeFiles.MAX_CARD_BYTES + 1 }.let { it == ArcadeFiles.Kind.IMAGE || it == ArcadeFiles.Kind.PACKED_IMAGE }
+    }
 
     /**
      * Parses an .acgame the way the core's INI reader does: sections and keys in any case, `;` and
@@ -157,9 +181,11 @@ object Arcade {
      * cards folder, seeds its SRAM, and hands the core where everything is. A failure says, in the
      * player's language, what is missing and where it was looked for.
      */
-    fun prepare(context: Context, location: String): Result<Launch> = runCatching {
-        val game = read(context, location) ?: fail("arcade.error.unreadable")
+    fun prepare(context: Context, at: String): Result<Launch> = runCatching {
+        val location = pathOf(at)
+        val game = read(context, location) ?: return@runCatching prepareLoose(context, location)
         if (!hasArcadeBios(context)) fail("arcade.error.bios")
+        requireBiosFor(game.gameId)
         val files = locate(context, location) ?: fail("arcade.error.notInLibrary")
 
         val found = files.find(game.elf, inSubdir = game.subdir) ?: fail("arcade.error.elf", game.elf)
@@ -193,17 +219,158 @@ object Arcade {
             files.find(game.sram, inSubdir = game.subdir)?.let { files.copy(it, sram) }
         }
 
-        Launch(game, elf, media, sram.absolutePath, modeOf(game))
+        Launch(game, elf, media, sram.absolutePath, modeOf(game), location)
     }
+
+    /**
+     * A game kept as its own files ([ArcadeFiles]): its image at [location], its dongle beside it. The
+     * image is read where it is; the .acgame the core boots from is written into the app's storage, beside
+     * the game's SRAM, with the boot program from the boot files.
+     */
+    private fun prepareLoose(context: Context, location: String): Launch {
+        val files = locate(context, location) ?: fail("arcade.error.notInLibrary")
+        val name = displayName(context, location) ?: fail("arcade.error.unreadable")
+        val siblings = files.list()
+        val folderId = ArcadeFiles.idIn(files.folderName())
+        val id = ArcadeFiles.idIn(name) ?: folderId ?: fail("arcade.error.unreadable")
+        val size = siblings.firstOrNull { it.first == name }?.second ?: 0L
+        when (ArcadeFiles.kindOf(name) { size }) {
+            ArcadeFiles.Kind.IMAGE -> Unit
+            ArcadeFiles.Kind.PACKED_IMAGE -> fail("arcade.error.packed", name)
+            else -> fail("arcade.error.unreadable")
+        }
+        if (!hasArcadeBios(context)) fail("arcade.error.bios")
+        requireBiosFor(id)
+
+        val dir = gameDir(context, id).apply { mkdirs() }
+        val boot = ArcadeLibrary.bootProgram(context, id) ?: fail("arcade.error.bootFiles")
+        val elf = File(dir, "boot.elf")
+        if (!copyInto(elf) { boot.inputStream() }) fail("arcade.error.elf", elf.name)
+        val dongle = looseDongle(context, files, siblings, id, folderId) ?: fail("arcade.error.looseDongle", id)
+
+        val title = ArcadeLibrary.titles().firstOrNull { it.id == id }?.name?.takeIf { it.isNotBlank() } ?: id
+        val manifest = File(dir, "$id.$EXTENSION")
+        val text = "[game]\nname=$title\ngameid=$id\n\n[data]\nsubdir=\ndongle=$dongle\n"
+        if (!copyInto(manifest) { text.byteInputStream() }) fail("arcade.error.unreadable")
+        val game = AcGame(
+            gameId = id, name = title, subdir = "", elf = elf.name, mediaSrc = name, sram = "sram.bin",
+            dongle = dongle, card = "", jvsMode = "",
+        )
+        return Launch(game, elf.absolutePath, location, sramFile(context, game).absolutePath, modeOf(game), manifest.absolutePath)
+    }
+
+    /** The app's own folder for the game [id]: its SRAM, and for a game kept as its own files the .acgame
+     *  and boot program it boots from. */
+    private fun gameDir(context: Context, id: String): File =
+        File(File(MainActivityRuntime.assetCopyRoot(context), "arcade"), id)
+
+    /**
+     * The dongle of the game [id], in the memory cards folder: already there (from an earlier launch, or
+     * put there by hand), else copied there from beside its image (unpacked, if it is a .gz). It is named
+     * after the game and what it holds ([ArcadeFiles.dongleName]). Null when there is none.
+     */
+    private fun looseDongle(
+        context: Context,
+        files: Files,
+        siblings: List<Pair<String, Long>>,
+        id: String,
+        folderId: String?,
+    ): String? {
+        val cards = memcardsDir(context).apply { mkdirs() }
+        listOf("$id.ps2", "$id.bin").firstOrNull { File(cards, it).let { f -> f.isFile && f.length() > 0 } }
+            ?.let { return it }
+        // A .ps2 first, then a .bin, then a packed one: the likelier a file is the dongle, the earlier.
+        val candidates = siblings
+            .filter { (n, bytes) -> (ArcadeFiles.idIn(n) ?: folderId) == id && ArcadeFiles.kindOf(n) { bytes } == ArcadeFiles.Kind.CARD }
+            .sortedBy { (n, _) -> if (n.endsWith(".ps2", ignoreCase = true)) 0 else if (n.endsWith(".gz", ignoreCase = true)) 2 else 1 }
+        for ((n, _) in candidates) {
+            val source = files.find(n, inSubdir = "") ?: continue
+            val temp = File(cards, ".$id.dongle")
+            if (!files.copy(source, temp, unpack = n.endsWith(".gz", ignoreCase = true))) continue
+            val bytes = temp.length()
+            val target = File(cards, ArcadeFiles.dongleName(id, bytes))
+            if (bytes in ArcadeFiles.MIN_CARD_BYTES..ArcadeFiles.MAX_CARD_BYTES && temp.renameTo(target)) {
+                println("@@ANDROID_ARCADE@@ copied $n into the memory cards folder as ${target.name}")
+                return target.name
+            }
+            temp.delete()
+        }
+        return null
+    }
+
+    /** A location as the rest of this works with it: a path, or a content:// URI. The library lists a
+     *  game in a folder it reads directly by a file:// URI. */
+    private fun pathOf(location: String): String =
+        if (location.startsWith("file://")) Uri.parse(location).path ?: location else location
+
+    /** A document's or a file's own name. */
+    private fun displayName(context: Context, location: String): String? {
+        if (!location.startsWith("content://")) return File(location).name
+        return runCatching {
+            context.contentResolver.query(
+                Uri.parse(location), arrayOf(android.provider.OpenableColumns.DISPLAY_NAME), null, null, null,
+            )?.use { c -> if (c.moveToFirst()) c.getString(0) else null }
+        }.getOrNull()
+    }
+
+    /**
+     * What keeps the arcade game at [location] from starting, in the player's words (empty when nothing
+     * does): the checks [prepare] makes, without copying anything. For the NAMCO screen's list.
+     */
+    fun missing(context: Context, at: String): List<String> = runCatching {
+        val location = pathOf(at)
+        val parts = ArrayList<String>()
+        val bios = hasArcadeBios(context)
+        if (!bios) parts.add(I18n.get("arcade.part.bios"))
+        // An arcade BIOS the game does not run on is none for it (Battle Gear 3 and the System 256 one).
+        fun biosFor(id: String) {
+            if (bios) biosNeed(id).takeIf { it.isNotEmpty() }?.let { parts.add(I18n.get("arcade.part.biosBoard").format(it)) }
+        }
+        val files = locate(context, location) ?: return@runCatching parts
+        val game = read(context, location)
+        val cards = memcardsDir(context)
+        fun inCards(name: String) = File(cards, File(name).name).let { it.isFile && it.length() > 0 }
+        if (game != null) {
+            biosFor(game.gameId)
+            if (files.find(game.elf, inSubdir = game.subdir) == null) parts.add(I18n.get("arcade.part.boot"))
+            if (!inCards(game.dongle) && files.find(game.dongle, inSubdir = game.subdir, alsoBeside = true) == null)
+                parts.add(I18n.get("arcade.part.dongle"))
+            if (game.card.isNotEmpty() && !inCards(game.card) && files.find(game.card, inSubdir = game.subdir, alsoBeside = true) == null)
+                parts.add(I18n.get("arcade.part.card"))
+            return@runCatching parts
+        }
+        val name = displayName(context, location) ?: return@runCatching parts
+        val siblings = files.list()
+        val folderId = ArcadeFiles.idIn(files.folderName())
+        val id = ArcadeFiles.idIn(name) ?: folderId ?: return@runCatching parts
+        biosFor(id)
+        if (id !in ArcadeLibrary.bootGames(context)) parts.add(I18n.get("arcade.part.boot"))
+        val size = siblings.firstOrNull { it.first == name }?.second ?: 0L
+        if (ArcadeFiles.kindOf(name) { size } == ArcadeFiles.Kind.PACKED_IMAGE) parts.add(I18n.get("arcade.part.unpacked"))
+        val dongle = inCards("$id.ps2") || inCards("$id.bin") || siblings.any { (n, bytes) ->
+            (ArcadeFiles.idIn(n) ?: folderId) == id && ArcadeFiles.kindOf(n) { bytes } == ArcadeFiles.Kind.CARD
+        }
+        if (!dongle) parts.add(I18n.get("arcade.part.dongle"))
+        parts
+    }.getOrDefault(emptyList())
 
     /** Whether the BIOS folder has an arcade board's BIOS for the core to boot (VMManager picks it). */
     private fun hasArcadeBios(context: Context): Boolean {
         val dir = MainActivityRuntime.internalBiosDir(context)
         fun arcade(file: File) = file.isFile && file.length() in ARCADE_BIOS_SIZES &&
             runCatching { NativeApp.isArcadeBios(file.absolutePath) }.getOrDefault(false)
-        arcadeBios.value?.let { if (arcade(File(dir, it))) return true }
         return dir.listFiles()?.any(::arcade) == true
     }
+
+    /** Fails when the game [id] runs on none of the arcade BIOS files there, naming the one it needs. */
+    private fun requireBiosFor(id: String) {
+        biosNeed(id).takeIf { it.isNotEmpty() }?.let { fail("arcade.error.biosBoard", it) }
+    }
+
+    /** The board whose BIOS the game [id] needs when none of the arcade BIOS files there runs it ("System
+     *  246" for Battle Gear 3, which rejects the System 256 one), else "". The core's own choice at boot. */
+    private fun biosNeed(id: String): String =
+        if (!MainActivityRuntime.nativeReady.value) "" else runCatching { NativeApp.getArcadeBiosNeed(id) }.getOrDefault("")
 
     /** What the core takes as an arcade BIOS (BiosTools' MIN_ARCADE_BIOS_SIZE to MAX_BIOS_SIZE): the
      *  boards' BIOS is a 2 MB flash chip, dumped that way (MAME's sys246/sys256, r27v1602f.*). */
@@ -218,7 +385,15 @@ object Arcade {
          *  [alsoBeside], in the .acgame's own folder after that. A path or a content:// URI. */
         fun find(name: String, inSubdir: String, alsoBeside: Boolean = false): String?
 
-        fun copy(source: String, target: File): Boolean
+        /** Copies [source] to [target], unpacking it on the way when [unpack] (a .gz). */
+        fun copy(source: String, target: File, unpack: Boolean = false): Boolean
+
+        /** The files in the game's own folder (the .acgame's or the image's), with their sizes (0 when the
+         *  provider does not say). */
+        fun list(): List<Pair<String, Long>>
+
+        /** That folder's own name. */
+        fun folderName(): String?
     }
 
     private fun locate(context: Context, location: String): Files? {
@@ -256,8 +431,13 @@ object Arcade {
             return null
         }
 
-        override fun copy(source: String, target: File): Boolean =
-            copyInto(target) { File(source).inputStream() }
+        override fun copy(source: String, target: File, unpack: Boolean): Boolean =
+            copyInto(target) { File(source).inputStream().let { if (unpack) java.util.zip.GZIPInputStream(it) else it } }
+
+        override fun list(): List<Pair<String, Long>> =
+            dir.listFiles()?.filter { it.isFile }?.map { it.name to it.length() }.orEmpty()
+
+        override fun folderName(): String? = dir.name
     }
 
     private fun treeFiles(context: Context, uri: Uri): Files? = runCatching {
@@ -318,39 +498,50 @@ object Arcade {
             return caseless
         }
 
-        override fun copy(source: String, target: File): Boolean =
-            copyInto(target) { context.contentResolver.openInputStream(Uri.parse(source)) ?: error("unreadable") }
+        override fun copy(source: String, target: File, unpack: Boolean): Boolean = copyInto(target) {
+            val input = context.contentResolver.openInputStream(Uri.parse(source)) ?: error("unreadable")
+            if (unpack) java.util.zip.GZIPInputStream(input) else input
+        }
+
+        override fun list(): List<Pair<String, Long>> = runCatching {
+            val children = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, parentId)
+            val projection = arrayOf(
+                DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+                DocumentsContract.Document.COLUMN_SIZE,
+                DocumentsContract.Document.COLUMN_MIME_TYPE,
+            )
+            context.contentResolver.query(children, projection, null, null, null)?.use { c: Cursor ->
+                buildList {
+                    while (c.moveToNext()) {
+                        if (c.getString(2) == DocumentsContract.Document.MIME_TYPE_DIR) continue
+                        val display = c.getString(0) ?: continue
+                        add(display to (if (c.isNull(1)) 0L else c.getLong(1)))
+                    }
+                }
+            }
+        }.getOrNull().orEmpty()
+
+        override fun folderName(): String? = runCatching {
+            val folder = DocumentsContract.buildDocumentUriUsingTree(treeUri, parentId)
+            context.contentResolver.query(folder, arrayOf(DocumentsContract.Document.COLUMN_DISPLAY_NAME), null, null, null)
+                ?.use { c -> if (c.moveToFirst()) c.getString(0) else null }
+        }.getOrNull()
     }
 
     // ---- The arcade BIOS ---------------------------------------------------------------------------
 
-    private const val PREF_ARCADE_BIOS = "arcadeBios"
-
     /**
-     * The BIOS file (in the BIOS folder) the player picked for arcade games, or null to let the core
-     * choose: the best arcade (COH-H) BIOS it finds, the System 256 one first, which runs System 246
-     * games too. Never the console BIOS: an arcade BIOS cannot run console games, nor the other way.
+     * There is no arcade BIOS to pick: every one in the BIOS folder is in use (the core's FindArcadeBiosFor),
+     * the System 256 one for every game (PCSX2x6's default) and the System 246 one for a game that refuses
+     * it (Battle Gear 3). Never the console BIOS: an arcade BIOS cannot run console
+     * games, nor the other way. 2.8 had one picked for every arcade game; that pick is forgotten, in the
+     * app's preferences and in the core's settings ([Filenames] ArcadeBIOS), once the core is up.
      */
-    val arcadeBios = mutableStateOf<String?>(null)
-
-    fun loadArcadeBios() {
-        arcadeBios.value = MainActivityRuntime.prefs.getString(PREF_ARCADE_BIOS, null)?.takeIf { it.isNotBlank() }
-    }
-
-    fun setArcadeBios(fileName: String?) {
-        val name = fileName?.takeIf { it.isNotBlank() }
-        arcadeBios.value = name
-        MainActivityRuntime.prefs.edit().apply {
-            if (name == null) remove(PREF_ARCADE_BIOS) else putString(PREF_ARCADE_BIOS, name)
-        }.apply()
-        pushArcadeBios()
-    }
-
-    /** Hands the core the arcade BIOS choice ([Filenames] ArcadeBIOS), once its settings exist. */
-    fun pushArcadeBios() {
+    fun forgetArcadeBiosPick() {
+        MainActivityRuntime.prefs.edit().remove("arcadeBios").apply()
         if (!MainActivityRuntime.nativeReady.value) return
         runCatching {
-            NativeApp.setSetting("Filenames", "ArcadeBIOS", "string", arcadeBios.value.orEmpty())
+            NativeApp.setSetting("Filenames", "ArcadeBIOS", "string", "")
             NativeApp.commitSettings()
         }
     }

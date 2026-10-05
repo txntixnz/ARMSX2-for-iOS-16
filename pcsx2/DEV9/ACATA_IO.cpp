@@ -11,6 +11,7 @@
 #include "common/Console.h"
 #include "common/Error.h"
 #include "common/FileSystem.h"
+#include "fmt/format.h"
 
 #include "ACATA.h"
 #include "ACATA_IO_CHD.h"
@@ -108,7 +109,16 @@ void ACATA::TH::IO_Write(u32* addr, u32 size) {
 			return;
 		}
 		std::fflush(IMAGE);
-	} else Console.ErrorFmt("{}: skipping write due to CHD media", __FUNCTION__);
+	} else {
+		// ARMSX2: a CHD cannot be written, and these writes used to be dropped. They are kept beside the
+		// game's SRAM and read back over the CHD (ChdWrites), in this session and the next; never more
+		// than the DMA brought.
+		const u32 unit = CHD.GetSectorSize();
+		const u32 scale = unit ? sectorsize / unit : 0;
+		const u32 whole = sectorsize ? static_cast<u32>(std::min<u64>(size, static_cast<u64>(sectorsize) * nsector) / sectorsize) : 0;
+		if (scale == 0 || whole == 0 || !CHD.WriteSectors(static_cast<u64>(LBA) * scale, whole * scale, addr))
+			Console.ErrorFmt("{}: lba:{} sectors:{} of a CHD drive not kept", __FUNCTION__, LBA, nsector);
+	}
 }
 
 static bool probe_at(FILE* f, s64 pos, u8* dst, u32 len) {
@@ -171,13 +181,20 @@ int ACATA::TH::IO_OpenImage() {
 	unitbytes = 0;
 	unitdataoff = 0;
 	if (isCHD) {
-		if (CHD.Open(ACATA::imgpath)) {
+		// ARMSX2: with the reason, so a report tells a damaged file from one libchdr refuses.
+		std::string why;
+		if (CHD.Open(ACATA::imgpath, &why)) {
 			u32 secsize = CHD.GetSectorSize();
 			if (secsize != sectorsize) 
 				Console.ErrorFmt("ACATA: CHD sectorsize mismatches declaration {} vs {}", secsize, sectorsize);
 			sectorsize = secsize;
 			ACATA::TH::IMAGESIZE = (CHD.GetSectorCount() * sectorsize);
-		} else return EIO;
+			if (ACATA::MediaType == ACMEDIATYPE::ACHDD)
+				CHD.OpenWrites(ACATA::writespath);
+		} else {
+			open_error = fmt::format("Cannot open the arcade game's media image '{}': {}.", ACATA::imgpath, why);
+			return EIO;
+		}
 		Console.WriteLn("%s: CHD image opened ok", __FUNCTION__);
 	} else {
 		// ARMSX2: through FileSystem, which also opens an Android content:// document (read-only: a hard

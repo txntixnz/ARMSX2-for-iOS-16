@@ -888,10 +888,16 @@ open class MainActivityRuntime : ComponentActivity() {
             println("@@ANDROID_ARCADE@@ ${launch.game.gameId} mode=${launch.mode} elf=${launch.elf.take(200)} media=${launch.media.take(200)}")
             NativeApp.setArcadeLaunchFiles(launch.elf, launch.media, launch.sram)
             com.armsx2.arcade.Arcade.sessionMode.intValue = launch.mode
+            com.armsx2.arcade.Arcade.sessionGameId.value = launch.game.gameId
+            // The player's own layout for this game's cabinet (Arcade controls), before any press arrives.
+            com.armsx2.arcade.ArcadeControls.apply(launch.game.gameId)
             try {
-                NativeApp.runVMThread(path)
+                // The game's .acgame, or for a game kept as its own files the one written for it.
+                NativeApp.runVMThread(launch.manifest)
             } finally {
                 com.armsx2.arcade.Arcade.sessionMode.intValue = -1
+                com.armsx2.arcade.Arcade.sessionGameId.value = null
+                com.armsx2.arcade.ArcadeControls.apply(null)
             }
             runCatching { NativeApp.getLastBootError() }.getOrNull()?.takeIf { it.isNotBlank() }?.let { error ->
                 com.armsx2.arcade.Arcade.notice.value = com.armsx2.i18n.I18n.get("arcade.error.boot").format(error)
@@ -1898,6 +1904,52 @@ open class MainActivityRuntime : ComponentActivity() {
             }
         }
 
+        /**
+         * Puts the APK's resources in the data folder for the core (shaders, the GameDB, fonts,
+         * fullscreenui, patches.zip, the controller DB, at <data folder>/resources), and on a new install
+         * of the app drops the regenerable GPU caches. Off the main thread, before the core starts.
+         *
+         * The files kept in step with the APK are rewritten only when this install has not written them
+         * yet: the marker beside them names the install that did, and is written after a clean pass, so a
+         * failed one is retried at the next launch. A data folder two installs share (stable and nightly)
+         * gets the files of whichever started last.
+         */
+        private fun ComponentActivity.prepareDataFolder() {
+            val info = runCatching { packageManager.getPackageInfo(packageName, 0) }.getOrNull()
+            val install = "$packageName ${BuildConfig.VERSION_CODE} ${BuildConfig.VERSION_NAME} ${info?.lastUpdateTime}"
+            val root = assetCopyRoot(applicationContext)
+
+            val shipped = File(File(root, "resources"), ".install")
+            MainActivity.refreshShippedAssets = runCatching { shipped.readText() }.getOrNull() != install
+            MainActivity.copyFailures = 0
+            copyAssetAll(applicationContext, "resources")
+            if (MainActivity.refreshShippedAssets && MainActivity.copyFailures == 0)
+                runCatching { shipped.writeText(install) }
+
+            // On any new install of the app, drop the regenerable GPU caches. The native caches carry
+            // their own build and driver stamps and discard themselves on a mismatch; this is the second
+            // line, for anything an older build wrote before those stamps existed. The marker lives in
+            // the data root beside the caches, not in this package's preferences: a data root shared by
+            // two installs (stable and nightly) is wiped whenever the other one last used it, and a
+            // data root that moved is wiped where it now is. lastUpdateTime changes on every install,
+            // so a rebuilt APK with an unchanged versionCode counts too. The marker is written only
+            // after the wipe succeeded, so a failed wipe is retried on the next launch.
+            runCatching {
+                val cacheDir = File(root, "cache")
+                val marker = File(cacheDir, ".install")
+                val recorded = runCatching { marker.readText() }.getOrNull()
+                if (recorded != install) {
+                    val wiped = !cacheDir.exists() || cacheDir.deleteRecursively()
+                    if (wiped && cacheDir.mkdirs()) {
+                        marker.writeText(install)
+                        android.util.Log.i("ARMSX2", "New install ($install): cleared GS shader/pipeline cache")
+                    } else {
+                        android.util.Log.w("ARMSX2", "New install ($install): could not clear ${cacheDir.path}")
+                    }
+                }
+            }
+        }
+
         private fun sameFilePath(a: File, b: File): Boolean {
             val ca = runCatching { a.canonicalFile }.getOrDefault(a.absoluteFile)
             val cb = runCatching { b.canonicalFile }.getOrDefault(b.absoluteFile)
@@ -2095,37 +2147,10 @@ open class MainActivityRuntime : ComponentActivity() {
             kr.co.iefriends.pcsx2.NativeApp.setAutoRendererGpuStrings(gl.vendor, gl.renderer, gl.version)
         }
 
-        // Default resources — shaders, GameIndex, fonts, fullscreenui,
-        // patches.zip, controller DB. assetCopyRoot resolves to the
-        // user's chosen systemDir (now valid post-setup) so emucore
-        // finds them at <systemDir>/resources/...
-        copyAssetAll(applicationContext, "bios")
-        copyAssetAll(applicationContext, "resources")
-
-        // On any new install of the app, drop the regenerable GPU caches. The native caches carry
-        // their own build and driver stamps and discard themselves on a mismatch; this is the second
-        // line, for anything an older build wrote before those stamps existed. The marker lives in
-        // the data root beside the caches, not in this package's preferences: a data root shared by
-        // two installs (stable and nightly) is wiped whenever the other one last used it, and a
-        // data root that moved is wiped where it now is. lastUpdateTime changes on every install,
-        // so a rebuilt APK with an unchanged versionCode counts too. The marker is written only
-        // after the wipe succeeded, so a failed wipe is retried on the next launch.
-        runCatching {
-            val info = packageManager.getPackageInfo(packageName, 0)
-            val install = "$packageName ${BuildConfig.VERSION_CODE} ${BuildConfig.VERSION_NAME} ${info.lastUpdateTime}"
-            val cacheDir = File(assetCopyRoot(applicationContext), "cache")
-            val marker = File(cacheDir, ".install")
-            val recorded = runCatching { marker.readText() }.getOrNull()
-            if (recorded != install) {
-                val wiped = !cacheDir.exists() || cacheDir.deleteRecursively()
-                if (wiped && cacheDir.mkdirs()) {
-                    marker.writeText(install)
-                    android.util.Log.i("ARMSX2", "New install ($install): cleared GS shader/pipeline cache")
-                } else {
-                    android.util.Log.w("ARMSX2", "New install ($install): could not clear ${cacheDir.path}")
-                }
-            }
-        }
+        // The shipped resources and the GPU cache wipe after a new install are written into the data folder
+        // at the start of the background block below (prepareDataFolder), before the core starts: here, on
+        // the main thread, they held up the first screen long enough on an SD card for Android to report
+        // the app as not responding.
 
         // Point the ANGLE EGL env vars at the bundled libs (or clear them) before the
         // GS thread ever opens a GL context. Re-applied per launch below too.
@@ -2158,6 +2183,7 @@ open class MainActivityRuntime : ComponentActivity() {
         // cosmetic and must not block first paint / risk an ANR on slow SD cards.)
 
         invoke {
+            prepareDataFolder()
             NativeApp.initializeOnce(applicationContext)
             nativeReady.value = true
 
@@ -2190,11 +2216,8 @@ open class MainActivityRuntime : ComponentActivity() {
                     NativeApp.commitSettings()
                 }
             }
-            // The arcade games' BIOS, kept apart from the console one (Arcade.arcadeBios).
-            runCatching {
-                com.armsx2.arcade.Arcade.loadArcadeBios()
-                com.armsx2.arcade.Arcade.pushArcadeBios()
-            }
+            // The arcade games' BIOS is never picked: each game starts with one it runs on (Arcade.forgetArcadeBiosPick).
+            runCatching { com.armsx2.arcade.Arcade.forgetArcadeBiosPick() }
 
             // Mirror the canonical (app-private) BIOS into the user's data root at
             // <dataRoot>/bios so it's visible/backup-able next to cache/covers/etc.
@@ -2599,11 +2622,11 @@ open class MainActivityRuntime : ComponentActivity() {
         runCatching { kr.co.iefriends.pcsx2.NativeApp.setAdpfEnabled(prefs.getBoolean("ui.adpf", false)) }
 
         // Arcade holds Compose state the first frame reads (its launch notice), and the emucore
-        // init below reaches it first, from its own thread (loadArcadeBios). A state made on another
+        // init below reaches it first, from its own thread (forgetArcadeBiosPick). A state made on another
         // thread while a composition is running cannot be read by that composition: the first frame
         // threw "Reading a state that was created after the snapshot was taken" and the app could
         // not open. So it is made here, on the main thread, before either of them starts.
-        com.armsx2.arcade.Arcade.loadArcadeBios()
+        com.armsx2.arcade.Arcade.forgetArcadeBiosPick()
 
         // Defer asset copy + emucore init until setup is complete. On the
         // first-ever run, `systemDir` isn't picked yet at onCreate time —
