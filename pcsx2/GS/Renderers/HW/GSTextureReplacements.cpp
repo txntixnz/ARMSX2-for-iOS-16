@@ -130,11 +130,7 @@ namespace GSTextureReplacements
 	static const ReplacementTexture* InsertReplacementCacheLocked(const TextureName& name, ReplacementTexture& tex);
 	static void ResetReplacementCacheLocked();
 
-	static void StartWorkerThread();
-	static void StopWorkerThread();
-	static void QueueWorkerThreadItem(std::function<void()> fn, bool high_priority);
 	static void WorkerThreadEntryPoint();
-	static void SyncWorkerThread();
 	static void CancelPendingLoadsAndDumps();
 	static void NotifyStartupCompleteForCurrentGame();
 
@@ -182,6 +178,9 @@ namespace GSTextureReplacements
 	static std::condition_variable s_worker_thread_cv;
 	static std::deque<std::pair<std::function<void()>, bool>> s_worker_thread_queue;
 	static bool s_worker_thread_running = false;
+
+	/// Set while the worker runs a job it has taken off the queue.
+	static bool s_worker_thread_busy = false;
 }; // namespace GSTextureReplacements
 
 size_t GSTextureReplacements::ReplacementTextureBytes(const ReplacementTexture& tex)
@@ -1229,9 +1228,11 @@ void GSTextureReplacements::WorkerThreadEntryPoint()
 
 		std::function<void()> fn = std::move(s_worker_thread_queue.front().first);
 		s_worker_thread_queue.pop_front();
+		s_worker_thread_busy = true;
 		lock.unlock();
 		fn();
 		lock.lock();
+		s_worker_thread_busy = false;
 	}
 }
 
@@ -1244,7 +1245,7 @@ void GSTextureReplacements::SyncWorkerThread()
 	// not the most efficient by far, but it only gets called on config changes, so whatever
 	for (;;)
 	{
-		if (s_worker_thread_queue.empty())
+		if (s_worker_thread_queue.empty() && !s_worker_thread_busy)
 			break;
 
 		lock.unlock();
@@ -1255,6 +1256,9 @@ void GSTextureReplacements::SyncWorkerThread()
 
 void GSTextureReplacements::CancelPendingLoadsAndDumps()
 {
+	// The pending and loaded lists belong to the cache mutex, and the worker can be inside a load
+	// that changes them. Lock in the order the loader does: cache mutex, then worker mutex.
+	std::unique_lock<std::mutex> cache_lock(s_replacement_texture_cache_mutex);
 	std::unique_lock<std::mutex> lock(s_worker_thread_mutex);
 	while (!s_worker_thread_queue.empty())
 		s_worker_thread_queue.pop_back();
