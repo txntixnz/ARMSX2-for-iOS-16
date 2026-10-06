@@ -16,29 +16,158 @@ for p in (build_params, graphics, ios_main):
 bp = build_params.read_text()
 
 if "ARMSX2_IOS16_A15_TARGET_V961" not in bp:
-    a12 = 'add_compile_options("-mcpu=apple-a12")'
-    a15 = 'add_compile_options("-mcpu=apple-a15")'
+    # Upstream has changed the generic iOS baseline over time (A12 -> A10).
+    # Match the active iOS Apple CPU line semantically instead of pinning the
+    # patcher to one historical baseline. Our private build still targets A15.
+    cpu_re = re.compile(
+        r'(?m)^(?P<indent>[ \\t]*)'
+        r'add_compile_options\\("-mcpu=apple-(?P<cpu>a10|a12|a15)"\\)'
+        r'[ \\t]*
+# ---------------------------------------------------------------------------
+# 2) Graphics UI switches.
+#    - 2x presentation surface: optional cap (default ON; user can disable).
+#    - 1.75x efficiency cap: optional experiment, default OFF.
+#    - Stock CAMetalLayer drawable queue retained.
+# ---------------------------------------------------------------------------
+gfx = graphics.read_text()
 
-    if bp.count(a12) == 1:
-        bp = bp.replace(
-            a12,
-            '# ARMSX2_IOS16_A15_TARGET_V961\n'
-            '\t\tadd_compile_options("-mcpu=apple-a15")',
-            1,
-        )
-    elif bp.count(a15) == 1:
-        bp = bp.replace(
-            a15,
-            '# ARMSX2_IOS16_A15_TARGET_V961\n'
-            '\t\tadd_compile_options("-mcpu=apple-a15")',
-            1,
-        )
-    else:
+if "// ARMSX2_IOS16_A15_METAL_UI_V961" not in gfx:
+    state_anchor = "    @State private var showShaderCacheResult = false\n"
+    if gfx.count(state_anchor) != 1:
         raise SystemExit(
-            "A15/Metal V9.6.1: could not find exactly one iOS Apple CPU compile target."
+            "A15/Metal V9.6.1: Graphics settings state anchor changed upstream."
         )
 
+    state_block = (
+        state_anchor
+        + "    // ARMSX2_IOS16_A15_METAL_UI_V961\n"
+        + '    @AppStorage("ARMSX2_MetalPresentation2x") '
+          "private var metalPresentation2x = true\n"
+        + '    @AppStorage("ARMSX2_MetalPresentation175x") '
+          "private var metalPresentation175x = false\n"
+    )
+    gfx = gfx.replace(state_anchor, state_block, 1)
+
+    # Upstream changed the Performance row from a GS Back Thread picker
+    # to a GS Multi-threading toggle. Support either layout without replacing it.
+    perf_anchor_options = (
+        '                Toggle(settings.localized("GS Multi-threading"), isOn: Binding(\n',
+        '                intPicker("GS Back Thread", selection: $settings.backThreadMode, options: [\n',
+    )
+    matched_anchors = [a for a in perf_anchor_options if gfx.count(a) == 1]
+    if len(matched_anchors) != 1:
+        raise SystemExit(
+            "A15/Metal V9.6.3: expected one recognizable Graphics Performance row."
+        )
+
+    perf_block = '''                Toggle(settings.localized("2× Metal Presentation Scale"), isOn: $metalPresentation2x)
+                Text(settings.localized("Caps only the final iOS Metal presentation surface at 2× instead of the display's native scale. PS2 internal rendering resolution is unchanged. Fully close and relaunch ARMSX2 after changing this option."))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                Toggle(settings.localized("1.75× Metal Efficiency Scale"), isOn: $metalPresentation175x)
+                Text(settings.localized("Experimental. When enabled, caps the final Metal presentation surface at 1.75× for extra GPU headroom and lower power draw. This overrides the 2× cap but does not change PS2 internal resolution. Fully close and relaunch ARMSX2 after changing it."))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+'''
+    gfx = gfx.replace(matched_anchors[0], perf_block + matched_anchors[0], 1)
+    graphics.write_text(gfx)
+
+# ---------------------------------------------------------------------------
+# 3) Final iOS presentation surface only. Keep stock CAMetalLayer queue.
+# ---------------------------------------------------------------------------
+im = ios_main.read_text()
+
+if "// ARMSX2_IOS16_A15_METAL_NATIVE_V961" not in im:
+    scale_re = re.compile(
+        r'(?ms)^- \(CGFloat\)armsx2NativeContentScale \{.*?^\}\n'
+        r'(?=- \(void\)armsx2ApplyNativeContentScale)'
+    )
+    matches = list(scale_re.finditer(im))
+    if len(matches) != 1:
+        raise SystemExit(
+            f"A15/Metal V9.6.1: expected one native-scale method, found {len(matches)}."
+        )
+
+    scale_method = textwrap.dedent("""\
+        // ARMSX2_IOS16_A15_METAL_NATIVE_V961
+        - (CGFloat)armsx2NativeContentScale {
+            UIScreen* screen = self.window.screen ?: UIScreen.mainScreen;
+            CGFloat scale = screen.nativeScale > 0.0 ? screen.nativeScale : screen.scale;
+            if (scale <= 0.0)
+                scale = 1.0;
+
+            NSUserDefaults* defaults = [NSUserDefaults standardUserDefaults];
+            const BOOL use175xPresentation =
+                [defaults boolForKey:@"ARMSX2_MetalPresentation175x"];
+
+            id storedValue = [defaults objectForKey:@"ARMSX2_MetalPresentation2x"];
+            const BOOL use2xPresentation = storedValue ? [storedValue boolValue] : YES;
+
+            // 1.75x is an optional efficiency experiment and deliberately
+            // overrides the 2x cap when enabled. Turning it back off
+            // restores the previous presentation-scale selection.
+            if (use175xPresentation)
+                scale = MIN(scale, (CGFloat)1.75);
+            else if (use2xPresentation)
+                scale = MIN(scale, (CGFloat)2.0);
+
+            return scale;
+        }
+    """)
+    im = scale_re.sub(scale_method, im, count=1)
+
+    apply_re = re.compile(
+        r'(?ms)^- \(void\)armsx2ApplyNativeContentScale \{.*?^\}\n'
+        r'(?=- \(void\)layoutSubviews)'
+    )
+    matches = list(apply_re.finditer(im))
+    if len(matches) != 1:
+        raise SystemExit(
+            f"A15/Metal V9.6.1: expected one apply-scale method, found {len(matches)}."
+        )
+
+    apply_method = textwrap.dedent("""\
+        - (void)armsx2ApplyNativeContentScale {
+            const CGFloat scale = [self armsx2NativeContentScale];
+            self.contentScaleFactor = scale;
+            self.layer.contentsScale = scale;
+            ((CAMetalLayer*)self.layer).contentsScale = scale;
+        }
+    """)
+    im = apply_re.sub(apply_method, im, count=1)
+    ios_main.write_text(im)
+
+print("A15/Metal V9.6.3 patch applied successfully.")
+print("  CPU target: apple-a15")
+print("  2x presentation scale: switchable, default ON")
+print("  1.75x efficiency scale: switchable, default OFF")
+print("  CAMetalLayer drawable queue: stock behavior retained")
+print("  PS2 internal rendering resolution: unchanged")
+
+    )
+    matches = list(cpu_re.finditer(bp))
+    if len(matches) != 1:
+        candidates = [
+            line.strip()
+            for line in bp.splitlines()
+            if 'add_compile_options("-mcpu=apple-' in line
+        ]
+        raise SystemExit(
+            "A15/Metal V9.6.4: could not identify exactly one supported iOS "
+            f"Apple CPU compile target. Candidates: {candidates}"
+        )
+
+    m = matches[0]
+    original_cpu = m.group("cpu")
+    replacement = (
+        f'{m.group("indent")}# ARMSX2_IOS16_A15_TARGET_V961\\n'
+        f'{m.group("indent")}add_compile_options("-mcpu=apple-a15")'
+    )
+    bp = bp[:m.start()] + replacement + bp[m.end():]
     build_params.write_text(bp)
+    print(f"A15 CPU target patched: apple-{original_cpu} -> apple-a15")
 
 # ---------------------------------------------------------------------------
 # 2) Graphics UI switches.
