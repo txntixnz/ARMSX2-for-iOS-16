@@ -728,9 +728,9 @@ jobs:
             platforms/ios/app/src/main/cpp/cmake/BuildParameters.cmake
           grep -q 'add_compile_options("-mcpu=apple-a15")' \
             platforms/ios/app/src/main/cpp/cmake/BuildParameters.cmake
-          if grep -q 'add_compile_options("-mcpu=apple-a12")' \
+          if grep -Eq '^[[:space:]]*add_compile_options\\("-mcpu=apple-a(10|12)"\\)' \
             platforms/ios/app/src/main/cpp/cmake/BuildParameters.cmake; then
-            echo 'ERROR: apple-a12 compile target still active.' >&2
+            echo 'ERROR: generic iOS A10/A12 compile target still active.' >&2
             exit 1
           fi
 
