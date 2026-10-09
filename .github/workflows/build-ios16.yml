@@ -1,7 +1,23 @@
-name: Build ARMSX2 for iOS 16 (v9.6.2 A15 2x Metal + Juiced fix)
+name: ARMSX2 iOS 16 STABLE v2.5.x (A15 + custom controls)
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - ios16-stable-v25-a15
+    paths:
+      - '.github/workflows/build-ios16.yml'
+      - '.github/workflows/ios16-*.py'
+      - 'platforms/ios/**'
+      - 'pcsx2/**'
+      - 'common/**'
+      - '3rdparty/**'
+      - 'cmake/**'
+      - 'bin/**'
+
+concurrency:
+  group: ios16-v25-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -12,8 +28,38 @@ jobs:
     runs-on: macos-26
 
     steps:
-      - name: Checkout ARMSX2
+      - name: Checkout only iOS, native core and shared dependencies
         uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+          filter: blob:none
+          sparse-checkout: |
+            .github
+            3rdparty
+            bin
+            cmake
+            common
+            pcsx2
+            platforms/android
+            platforms/ios
+
+      - name: Reuse downloaded Rust crates
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ios16-v25-cargo-${{ runner.os }}-${{ hashFiles('platforms/ios/**/Cargo.lock', 'platforms/ios/**/Cargo.toml') }}
+          restore-keys: |
+            ios16-v25-cargo-${{ runner.os }}-
+
+      - name: Reject unsupported upstream 2.6.x sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -Fxq '19c83bf065ed21a19d8c46a1f578e37d2dab8efd' .armsx2-ios16-last-built-upstream
+          grep -Fq 'set(ARMSX2_VERSION_MINOR 5)' platforms/ios/app/src/main/cpp/CMakeLists.txt
+          echo 'Frozen pre-2.6.0 ARMSX2 source verified.'
 
       - name: Select Xcode
         run: sudo xcode-select -switch /Applications/Xcode.app
@@ -2183,44 +2229,59 @@ jobs:
         continue-on-error: true
         shell: bash
         run: |
-          rm -rf platforms/ios/build-ios-xcode
+          # Keep incremental outputs if this runner's workspace is reusable.
           ./platforms/ios/scripts/build-ios-ipa.sh
 
-      - name: Verify deployment target
+      - name: Audit iOS 16 Mach-O and linked frameworks
+        id: compatibility
         if: steps.build.outcome == 'success'
         shell: bash
         run: |
+          set -euo pipefail
           APP='platforms/ios/build-ios-xcode/Release-iphoneos/ARMSX2iOS.app'
           BIN="$APP/ARMSX2iOS"
-          echo 'Info.plist MinimumOSVersion:'
-          /usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion' "$APP/Info.plist" || true
-          echo
-          echo 'Mach-O build version:'
-          xcrun vtool -show-build "$BIN"
-          echo
-          if ! xcrun vtool -show-build "$BIN" | grep -Eq 'minos[[:space:]]+16(\.0+)?'; then
-            echo 'ERROR: Mach-O executable does not report iOS 16.x as minos.' >&2
+
+          echo 'Checking bundled Info.plist minimum iOS version:'
+          MIN_OS="$(/usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion' "$APP/Info.plist")"
+          printf 'MinimumOSVersion=%s\n' "$MIN_OS"
+          if ! printf '%s\n' "$MIN_OS" | grep -Eq '^16(\.[0-9]+)*$'; then
+            echo 'ERROR: app Info.plist no longer targets iOS 16.' >&2
             exit 1
           fi
 
+          echo 'Checking Mach-O load command:'
+          xcrun vtool -show-build "$BIN"
+          if ! xcrun vtool -show-build "$BIN" | grep -Eq 'minos[[:space:]]+16(\.[0-9]+)*'; then
+            echo 'ERROR: app Mach-O no longer targets iOS 16.' >&2
+            exit 1
+          fi
+
+          echo 'Checking linked system frameworks (launch-time availability):'
+          xcrun otool -L "$BIN"
+          if xcrun otool -L "$BIN" | grep -Eq 'Symbols\.framework/Symbols'; then
+            echo 'ERROR: Symbols.framework is unavailable on iOS 16 (dyld launch crash).' >&2
+            exit 1
+          fi
+          echo 'iOS 16 compatibility guard passed. On-device runtime test still required.'
+
       - name: Upload IPA
-        if: steps.build.outcome == 'success'
+        if: steps.build.outcome == 'success' && steps.compatibility.outcome == 'success'
         uses: actions/upload-artifact@v7
         with:
-          name: ARMSX2-iOS16-unsigned-v9.6.2-a15-2x-metal-juiced-fix
+          name: ARMSX2-iOS16-STABLE-v25-a15-unsigned
           path: platforms/ios/build-ios-xcode/ARMSX2-iOS-unsigned.ipa
           if-no-files-found: error
 
       - name: Upload build log
-        if: always()
+        if: steps.build.outcome == 'failure' || steps.compatibility.outcome == 'failure'
         uses: actions/upload-artifact@v7
         with:
-          name: ARMSX2-iOS16-build-log-v9.6.2-a15-2x-metal-juiced-fix
+          name: ARMSX2-iOS16-STABLE-v25-build-log
           path: platforms/ios/build-ios-xcode/xcodebuild.log
           if-no-files-found: ignore
 
       - name: Fail if source build failed
         if: steps.build.outcome == 'failure'
         run: |
-          echo 'The iOS 16 V9.6.2 A15 2x-Metal Juiced-fix build reached a compiler/linker blocker. Download ARMSX2-iOS16-build-log-v9.6.2-a15-2x-metal-juiced-fix and inspect the first real error.' >&2
+          echo 'The stable iOS 16 v2.5.x build failed. Download the failure log artifact and inspect the first compiler/linker error.' >&2
           exit 1
