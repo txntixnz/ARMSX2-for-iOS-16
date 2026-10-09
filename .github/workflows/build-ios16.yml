@@ -1,7 +1,10 @@
-name: Build ARMSX2 for iOS 16 (v9.6.4 A15 GS pass coalescing test)
+name: ARMSX2 iOS 16 v2.6.0 experimental compatibility test
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - ios16-v260-compat-experimental
 
 permissions:
   contents: read
@@ -12,8 +15,29 @@ jobs:
     runs-on: macos-26
 
     steps:
-      - name: Checkout ARMSX2
+      - name: Checkout iOS source and shared native core
         uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+          sparse-checkout: |
+            .github
+            3rdparty
+            bin
+            cmake
+            common
+            pcsx2
+            platforms/android
+            platforms/ios
+
+      - name: Cache Rust dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ios16-v260-cargo-${{ runner.os }}-${{ hashFiles('platforms/ios/**/Cargo.lock', 'platforms/ios/**/Cargo.toml') }}
+          restore-keys: |
+            ios16-v260-cargo-${{ runner.os }}-
 
       - name: Select Xcode
         run: sudo xcode-select -switch /Applications/Xcode.app
@@ -2243,7 +2267,6 @@ jobs:
         continue-on-error: true
         shell: bash
         run: |
-          rm -rf platforms/ios/build-ios-xcode
           ./platforms/ios/scripts/build-ios-ipa.sh
 
       - name: Verify deployment target
@@ -2263,24 +2286,30 @@ jobs:
             exit 1
           fi
 
-      - name: Upload IPA
+      - name: Audit iOS 16 launch dependencies
+        id: ios16_audit
         if: steps.build.outcome == 'success'
+        shell: bash
+        run: python3 .github/scripts/check-ios16-app.py
+
+      - name: Upload IPA
+        if: steps.build.outcome == 'success' && steps.ios16_audit.outcome == 'success'
         uses: actions/upload-artifact@v7
         with:
-          name: ARMSX2-iOS16-unsigned-v9.6.4-a15-gs-pass-coalescing-test
+          name: ARMSX2-iOS16-v260-experimental-unsigned
           path: platforms/ios/build-ios-xcode/ARMSX2-iOS-unsigned.ipa
           if-no-files-found: error
 
       - name: Upload build log
-        if: always()
+        if: steps.build.outcome == 'failure' || steps.ios16_audit.outcome == 'failure'
         uses: actions/upload-artifact@v7
         with:
-          name: ARMSX2-iOS16-build-log-v9.6.4-a15-gs-pass-coalescing-test
+          name: ARMSX2-iOS16-v260-experimental-build-log
           path: platforms/ios/build-ios-xcode/xcodebuild.log
           if-no-files-found: ignore
 
       - name: Fail if source build failed
         if: steps.build.outcome == 'failure'
         run: |
-          echo 'The iOS 16 V9.6.4 A15 GS pass-coalescing build reached a compiler/linker blocker. Download ARMSX2-iOS16-build-log-v9.6.4-a15-gs-pass-coalescing-test and inspect the first real error.' >&2
+          echo 'The iOS 16 V9.6.4 A15 GS pass-coalescing build reached a compiler/linker blocker. Download ARMSX2-iOS16-v260-experimental-build-log and inspect the first real error.' >&2
           exit 1
