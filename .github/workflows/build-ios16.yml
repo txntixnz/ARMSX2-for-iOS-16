@@ -2267,7 +2267,8 @@ jobs:
         continue-on-error: true
         shell: bash
         run: |
-          ./platforms/ios/scripts/build-ios-ipa.sh
+          # Separate test app: do not overwrite your working 2.5 installation or its saves.
+          BUNDLE_ID=com.armsx2.ios.v260test ./platforms/ios/scripts/build-ios-ipa.sh
 
       - name: Verify deployment target
         if: steps.build.outcome == 'success'
@@ -2311,5 +2312,5 @@ jobs:
       - name: Fail if source build failed
         if: steps.build.outcome == 'failure'
         run: |
-          echo 'The iOS 16 V9.6.4 A15 GS pass-coalescing build reached a compiler/linker blocker. Download ARMSX2-iOS16-v260-experimental-build-log and inspect the first real error.' >&2
+          echo 'The experimental ARMSX2 2.6 / iOS 16 compatibility build hit a compiler/linker blocker. Download ARMSX2-iOS16-v260-experimental-build-log and inspect the first real error.' >&2
           exit 1
