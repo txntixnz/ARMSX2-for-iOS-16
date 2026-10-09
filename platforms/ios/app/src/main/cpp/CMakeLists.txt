@@ -338,6 +338,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
 		"-framework UIKit"
 		"-framework AVFoundation"
 		"-framework Metal"
+		"-framework MetalFX" # MTLFXSpatialScalerDescriptor (iOS 16+)
 		"-framework MetalKit"
 		"-framework QuartzCore"
 		"-framework CoreText"
