@@ -235,3 +235,39 @@ for path in root.rglob("*.swift"):
 print("V9.6.5 upstream SwiftUI/iOS16 compatibility patch complete:")
 for k, v in sorted(counts.items()):
     print(f"  {k}: {v}")
+
+
+# ARMSX2_IOS16_SETTINGS_NAVIGATION_FIX_20261009
+# iOS 16 NavigationStack must keep its root NavigationLink host registered
+# during a push. Upstream detaches the List as soon as navigationPath becomes
+# non-empty; on iOS 16 this can leave a blank destination. The additional
+# last-path check can also render Color.clear during path reconciliation.
+# Apply at build time so daily upstream syncs cannot revert the compatibility fix.
+settings_root = root / "Views/Settings/SettingsRootView.swift"
+settings_source = settings_root.read_text()
+settings_source = exact_replace(
+    settings_source,
+    "            if navigationPath.isEmpty {\n            List {",
+    "            // Keep NavigationLink registrations alive during an iOS 16 push.\n            List {",
+    "settings root List registration",
+)
+settings_source = exact_replace(
+    settings_source,
+    "#endif\n            }\n        }\n        .stableMenuContentGlassContainer()",
+    "#endif\n        }\n        .stableMenuContentGlassContainer()",
+    "settings root List conditional close",
+)
+settings_source = exact_replace(
+    settings_source,
+    "            if navigationPath.last == pane {\n                presentedSettingsDetail(for: pane)",
+    "            presentedSettingsDetail(for: pane)",
+    "settings destination path guard",
+)
+settings_source = exact_replace(
+    settings_source,
+    "            } else {\n                Color.clear\n                    .allowsHitTesting(false)\n                    .accessibilityHidden(true)\n            }\n        }\n        }\n        .onChange(of: resetToRootRequest)",
+    "        }\n        }\n        .onChange(of: resetToRootRequest)",
+    "settings destination blank fallback",
+)
+settings_root.write_text(settings_source)
+print("iOS 16 Settings NavigationStack stable-root and visible destination: OK")
