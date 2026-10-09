@@ -265,8 +265,8 @@ settings_source = exact_replace(
 )
 settings_source = exact_replace(
     settings_source,
-    "            } else {\n                Color.clear\n                    .allowsHitTesting(false)\n                    .accessibilityHidden(true)\n            }\n        }\n        }\n        .onChange(of: resetToRootRequest)",
-    "        }\n        }\n        .onChange(of: resetToRootRequest)",
+    "            } else {\n                Color.clear\n                    .allowsHitTesting(false)\n                    .accessibilityHidden(true)\n            }\n        }\n        }\n        .ios16OnChange(of: resetToRootRequest)",
+    "        }\n        }\n        .ios16OnChange(of: resetToRootRequest)",
     "settings destination blank fallback",
 )
 settings_root.write_text(settings_source)
