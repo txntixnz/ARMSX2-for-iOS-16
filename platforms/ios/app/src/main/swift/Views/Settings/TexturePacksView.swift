@@ -95,8 +95,11 @@ struct TexturePacksView<Options: View>: View {
         .sheet(isPresented: $showPicker) {
             ImportDocumentPicker(
                 allowsMultipleSelection: false,
-                legacyDocumentTypes: ["public.zip-archive", "public.data"],
-                legacyDocumentMode: .open
+                // Some iOS 16 Files locations cannot hand off a document in place.
+                // Import a local copy and let the archive installer validate its contents.
+                // public.item also covers files whose provider reports an unexpected UTI.
+                legacyDocumentTypes: ["public.item", "public.data", "public.content", "public.zip-archive"],
+                legacyDocumentMode: .import
             ) { result in
                 showPicker = false
                 switch result {
@@ -180,7 +183,7 @@ struct TexturePacksView<Options: View>: View {
     private func install(_ url: URL) async {
         importing = true
         let running = ARMSX2Bridge.currentTextureSerial()
-        // Read in place: a pack can be gigabytes, and a picker copy would need that space twice.
+        // The picker supplies a temporary local copy, available until the app exits.
         let result = await Task.detached(priority: .userInitiated) { () -> Result<String, Error> in
             let scoped = url.startAccessingSecurityScopedResource()
             defer { if scoped { url.stopAccessingSecurityScopedResource() } }
