@@ -1384,6 +1384,10 @@ final class MenuControllerInputRouter {
     /// Over a menu, the Undo macro undoes a save-state action instead of what its last button does.
     /// Any binding works, so it can sit on one side of the pad.
     private func completesUndoChord(_ gamepad: GCExtendedGamepad) -> Bool {
+        guard SettingsStore.shared.controllerMacrosEnabled else {
+            undoChordHeld = false
+            return false
+        }
         let held = SettingsStore.shared.controllerMacroUndoSaveState.isPressed(on: gamepad)
         defer { undoChordHeld = held }
         guard held, !undoChordHeld, saveStateUndoPending, frontmostManualNavigationCapture == nil else { return false }
@@ -1778,7 +1782,8 @@ final class MenuControllerInputRouter {
         _ gamepad: GCExtendedGamepad,
         profileID: ObjectIdentifier
     ) -> Bool {
-        guard !isMenuActive, ARMSX2Bridge.isVMRunning() else {
+        guard SettingsStore.shared.controllerMacrosEnabled,
+              !isMenuActive, ARMSX2Bridge.isVMRunning() else {
             emulationMacroLatches.removeValue(forKey: profileID)
             cancelEmulationMacroRepeats(profileID: profileID)
             return false
@@ -1817,6 +1822,7 @@ final class MenuControllerInputRouter {
     }
 
     private func publishControllerMacro(_ action: ControllerMacroAction) {
+        guard SettingsStore.shared.controllerMacrosEnabled else { return }
         if action == .quickMenu {
             sequence &+= 1
             latestQuickPauseRequest = MenuControllerQuickPauseRequest(
@@ -1837,6 +1843,7 @@ final class MenuControllerInputRouter {
             try? await Task.sleep(for: .milliseconds(320))
             guard let self, let gamepad, !Task.isCancelled else { return }
             while !Task.isCancelled,
+                  SettingsStore.shared.controllerMacrosEnabled,
                   !self.isMenuActive,
                   ARMSX2Bridge.isVMRunning(),
                   SettingsStore.shared.controllerMacroBinding(for: action)
@@ -3592,3 +3599,4 @@ private final class MenuControllerFeedbackPlayer {
         return generator
     }
 }
+

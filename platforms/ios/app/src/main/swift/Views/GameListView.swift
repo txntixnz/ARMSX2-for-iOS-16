@@ -3253,13 +3253,13 @@ struct GameListView: View {
                                 .resizable()
                                 .interpolation(.high)
                                 .scaledToFit()
-                                .frame(width: 154, height: 22)
+                                .frame(width: 124, height: 22)
                                 .padding(.horizontal, 18)
                                 .frame(minHeight: 42)
                                 .contentShape(Capsule())
                                 .modifier(controllerToolbarFocus(
                                     .bootBIOS,
-                                    minimumWidth: 190
+                                    minimumWidth: 160
                                 ))
                         }
                         .buttonStyle(.plain)
@@ -3273,8 +3273,8 @@ struct GameListView: View {
                                 .fixedSize(horizontal: true, vertical: false)
                                 .modifier(controllerToolbarFocus(
                                     .bootBIOS,
-                                    baseHorizontalPadding: 14,
-                                    minimumWidth: 112
+                                    baseHorizontalPadding: 10,
+                                    minimumWidth: 96
                                 ))
                         }
                         .buttonStyle(.plain)
@@ -3331,44 +3331,48 @@ struct GameListView: View {
                 ToolbarItem(id: "menu.more", placement: .topBarTrailing) {
                     Menu {
                         Button {
-                            presentMenuPanel("cover_import_all") {
-                                pendingCoverGameName = nil
-                                showCoverImporter = true
-                            }
-                        } label: {
-                            Label(settings.localized("Import Local Covers"), systemImage: "photo.badge.plus")
-                        }
-
-                        Button {
-                            downloadMissingCovers()
-                        } label: {
-                            Label(settings.localized("Download Missing Covers"), systemImage: "icloud.and.arrow.down")
-                        }
-                        .disabled(coverStore.isDownloadingCovers || games.isEmpty)
-
-                        Button {
-                            presentMenuPanel("cover_source") {
-                                coverTemplateDraft = coverStore.coverURLTemplate
-                                showCoverTemplateEditor = true
-                            }
-                        } label: {
-                            Label(settings.localized("Cover Source"), systemImage: "link")
-                        }
-
-                        Button {
-                            presentMenuPanel("cover_template_reset") {
-                                coverStore.coverURLTemplate = CoverStore.defaultCoverURLTemplate
-                                coverStore.lastCoverMessage = "Cover URL template reset to the ARMSX2 Android default."
-                                coverStore.showCoverAlert = true
-                            }
-                        } label: {
-                            Label(settings.localized("Reset Cover Template"), systemImage: "arrow.counterclockwise")
-                        }
-                        Divider()
-                        Button {
                             loadGames(forceMetadataRefresh: true)
                         } label: {
                             Label(settings.localized("Refresh"), systemImage: "arrow.clockwise")
+                        }
+                        Divider()
+                        Menu {
+                            Button {
+                                presentMenuPanel("cover_import_all") {
+                                    pendingCoverGameName = nil
+                                    showCoverImporter = true
+                                }
+                            } label: {
+                                Label(settings.localized("Import Local Covers"), systemImage: "photo.badge.plus")
+                            }
+
+                            Button {
+                                downloadMissingCovers()
+                            } label: {
+                                Label(settings.localized("Download Missing Covers"), systemImage: "icloud.and.arrow.down")
+                            }
+                            .disabled(coverStore.isDownloadingCovers || games.isEmpty)
+
+                            Button {
+                                presentMenuPanel("cover_source") {
+                                    coverTemplateDraft = coverStore.coverURLTemplate
+                                    showCoverTemplateEditor = true
+                                }
+                            } label: {
+                                Label(settings.localized("Cover Source"), systemImage: "link")
+                            }
+
+                            Button {
+                                presentMenuPanel("cover_template_reset") {
+                                    coverStore.coverURLTemplate = CoverStore.defaultCoverURLTemplate
+                                    coverStore.lastCoverMessage = "Cover URL template reset to the ARMSX2 Android default."
+                                    coverStore.showCoverAlert = true
+                                }
+                            } label: {
+                                Label(settings.localized("Reset Cover Template"), systemImage: "arrow.counterclockwise")
+                            }
+                        } label: {
+                            Label(settings.localized("Covers"), systemImage: "photo.stack")
                         }
                     } label: {
                         Image(systemName: "ellipsis")
@@ -10271,3 +10275,4 @@ private extension String {
         return ext.isEmpty ? "FILE" : ext
     }
 }
+

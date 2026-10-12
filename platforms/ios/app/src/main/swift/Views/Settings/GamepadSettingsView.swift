@@ -67,6 +67,7 @@ struct GamepadSettingsView: View {
         rightInstantDeadzoneEnabled: Bool
     ) -> [String] {
         var order = [
+                "settings.game-controller.macros-enabled",
                 "settings.game-controller.controller-macros",
                 "settings.game-controller.dead-zone",
                 "settings.game-controller.left-instant-deadzone",
@@ -127,18 +128,23 @@ struct GamepadSettingsView: View {
     var body: some View {
         Form {
             Section {
+                gamepadToggle(
+                    "Enable Controller Macros",
+                    id: "settings.game-controller.macros-enabled",
+                    isOn: $settings.controllerMacrosEnabled
+                )
                 linkedPaneRow(
                     .controllerMacros,
                     id: "settings.game-controller.controller-macros"
                 ) {
                     Label(
-                        settings.localized("Controller Macros"),
+                        settings.localized("Edit Controller Shortcuts"),
                         systemImage: "command"
                     )
                 }
             } footer: {
                 Text(settings.localized(
-                    "Customize two-button shortcuts used while emulation is running."
+                    "Off disables every controller shortcut and leaves gameplay buttons unchanged."
                 ))
             }
 
@@ -370,7 +376,10 @@ struct GamepadSettingsView: View {
             toggleCapture(for: btn.id)
         } label: {
             HStack {
-                // Left: assigned controller button (prominent)
+                Text(settings.localized(btn.name))
+                    .font(.body)
+                    .controllerFocusedTextColor()
+                Spacer()
                 if isCapturing {
                     Text(settings.localized("Press a button..."))
                         .font(.body)
@@ -378,14 +387,9 @@ struct GamepadSettingsView: View {
                         .foregroundStyle(.orange)
                 } else {
                     Text(settings.localized(sdlButtonName(currentSDL)))
-                        .font(.body)
-                        .controllerFocusedTextColor()
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
                 }
-                Spacer()
-                // Right: PS2 function name (secondary)
-                Text(settings.localized(btn.name))
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
             }
             .id(mappingVersion)
         }
@@ -447,7 +451,9 @@ private struct GamepadLinkedSettingsSheet: View {
         case .localMultiplayer:
             contentOrder = LocalMultiplayerSettingsView.controllerTargetOrder
         case .controllerMacros:
-            contentOrder = ControllerMacrosSettingsView.controllerTargetOrder
+            contentOrder = ControllerMacrosSettingsView.controllerTargetOrder(
+                macrosEnabled: settings.controllerMacrosEnabled
+            )
         default:
             contentOrder = []
         }
@@ -517,90 +523,158 @@ private struct GamepadLinkedSettingsSheet: View {
 }
 
 struct ControllerMacrosSettingsView: View {
-    static var controllerTargetOrder: [String] {
-        ControllerMacroAction.allCases.flatMap { action in
-            [
-                "controller.macros.\(action.rawValue).first",
-                "controller.macros.\(action.rawValue).second",
-            ]
-        } + ["controller.macros.reset"]
+    static func controllerTargetOrder(macrosEnabled: Bool) -> [String] {
+        ["controller.macros.enabled"] + (macrosEnabled
+            ? ControllerMacroAction.allCases.map { "controller.macros.\($0.rawValue).edit" }
+                + ["controller.macros.reset"]
+            : [])
     }
 
     @State private var settings = SettingsStore.shared
+    @State private var editingAction: ControllerMacroAction?
 
     var body: some View {
         Form {
-            ForEach(ControllerMacroAction.allCases) { action in
+            Section {
+                Toggle(settings.localized("Enable Controller Macros"),
+                       isOn: $settings.controllerMacrosEnabled)
+                    .controllerAccessibilityToggleTarget(
+                        id: "controller.macros.enabled",
+                        label: settings.localized("Enable Controller Macros"),
+                        isOn: $settings.controllerMacrosEnabled
+                    )
+            } footer: {
+                Text(settings.localized(settings.controllerMacrosEnabled
+                    ? "Choose a shortcut below to edit its two buttons."
+                    : "Macros are off. Buttons go directly to the game. Your saved shortcuts are kept."))
+            }
+
+            if settings.controllerMacrosEnabled {
+                Section(settings.localized("Shortcuts")) {
+                    ForEach(ControllerMacroAction.allCases) { action in
+                        Button {
+                            editingAction = action
+                        } label: {
+                            HStack(spacing: 12) {
+                                VStack(alignment: .leading, spacing: 3) {
+                                    Text(settings.localized(action.title))
+                                        .controllerFocusedTextColor()
+                                    Text(settings.controllerMacroBinding(for: action).title)
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                                Spacer()
+                                Image(systemName: "chevron.right")
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(.secondary)
+                            }
+                            .padding(.vertical, 2)
+                        }
+                        .controllerAccessibilityActionTarget(
+                            id: "controller.macros.\(action.rawValue).edit",
+                            label: settings.localized(action.title)
+                        ) {
+                            editingAction = action
+                        }
+                    }
+                }
+
                 Section {
-                    Picker(
-                        settings.localized("First Button"),
-                        selection: buttonBinding(for: action, first: true)
+                    ConfirmedSettingsResetButton(
+                        settings.localized("Reset Controller Macros"),
+                        confirmationTitle: settings.localized("Reset Controller Macros?"),
+                        confirmationMessage: settings.localized("This restores the shortcut buttons. The Enable Controller Macros setting stays unchanged."),
+                        completionMessage: settings.localized("Defaults Restored"),
+                        controllerTargetID: "controller.macros.reset"
                     ) {
-                        ForEach(ControllerMacroButton.allCases) { button in
-                            Text(settings.localized(button.title)).tag(button)
-                        }
+                        settings.resetControllerMacros()
                     }
-                    .controllerAccessibilityOptionsPickerTarget(
-                        id: "controller.macros.\(action.rawValue).first",
-                        label: settings.localized("\(action.title) First Button"),
-                        selection: buttonBinding(for: action, first: true),
-                        options: ControllerMacroButton.allCases.map {
-                            (id: $0, title: settings.localized($0.title))
-                        }
-                    )
+                    .uiCriticalForegroundStyle()
+                }
+            }
+        }
+        .controllerAccessibilityTargetOrder(Self.controllerTargetOrder(
+            macrosEnabled: settings.controllerMacrosEnabled
+        ))
+        .navigationTitle(settings.localized("Controller Macros"))
+        .navigationBarTitleDisplayMode(.inline)
+        .sheet(item: $editingAction) { action in
+            ControllerMacroEditorSheet(action: action)
+        }
+    }
+}
 
-                    Picker(
-                        settings.localized("Second Button"),
-                        selection: buttonBinding(for: action, first: false)
-                    ) {
-                        ForEach(ControllerMacroButton.allCases) { button in
-                            Text(settings.localized(button.title)).tag(button)
-                        }
-                    }
-                    .controllerAccessibilityOptionsPickerTarget(
-                        id: "controller.macros.\(action.rawValue).second",
-                        label: settings.localized("\(action.title) Second Button"),
-                        selection: buttonBinding(for: action, first: false),
-                        options: ControllerMacroButton.allCases.map {
-                            (id: $0, title: settings.localized($0.title))
-                        }
-                    )
+private struct ControllerMacroEditorSheet: View {
+    let action: ControllerMacroAction
+    @Environment(\.dismiss) private var dismiss
+    @Environment(\.menuControllerInputRouter) private var controllerInput
+    @State private var settings = SettingsStore.shared
 
-                    HStack {
-                        Text(settings.localized("Current Shortcut"))
-                        Spacer()
-                        Text(settings.controllerMacroBinding(for: action).title)
-                            .foregroundStyle(.secondary)
-                    }
-                } header: {
-                    Text(settings.localized(action.title))
+    private var targetPrefix: String { "controller.macros.\(action.rawValue)" }
+    private var targetOrder: [String] {
+        ["\(targetPrefix).first", "\(targetPrefix).second", "\(targetPrefix).done"]
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    macroButtonPicker(first: true)
+                    macroButtonPicker(first: false)
                 } footer: {
                     Text(settings.localized(action.detail))
                 }
-            }
-
-            Section {
-                ConfirmedSettingsResetButton(
-                    settings.localized("Reset Controller Macros"),
-                    confirmationTitle: settings.localized("Reset Controller Macros?"),
-                    confirmationMessage: settings.localized("This restores all controller shortcuts to their default button combinations."),
-                    completionMessage: settings.localized("Defaults Restored"),
-                    controllerTargetID: "controller.macros.reset"
-                ) {
-                    settings.resetControllerMacros()
+                Section(settings.localized("Current Shortcut")) {
+                    Text(settings.controllerMacroBinding(for: action).title)
+                        .font(.headline)
                 }
-                .uiCriticalForegroundStyle()
+            }
+            .navigationTitle(settings.localized(action.title))
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button(settings.localized("Done")) { dismiss() }
+                        .controllerAccessibilityActionTarget(
+                            id: "\(targetPrefix).done",
+                            label: settings.localized("Done")
+                        ) { dismiss() }
+                }
             }
         }
-        .controllerAccessibilityTargetOrder(Self.controllerTargetOrder)
-        .navigationTitle(settings.localized("Controller Macros"))
-        .navigationBarTitleDisplayMode(.inline)
+        .controllerAccessibilityTargetOrder(targetOrder)
+        .controllerAccessibilityNavigation(
+            controllerInput: controllerInput,
+            scopeKey: "\(targetPrefix).editor",
+            priority: 360,
+            orbStyle: .plain,
+            onBack: {
+                dismiss()
+                return true
+            },
+            usesExplicitTargetGeometryOnly: true,
+            preferredInitialFocusLabel: targetOrder.first
+        )
     }
 
-    private func buttonBinding(
-        for action: ControllerMacroAction,
-        first: Bool
-    ) -> Binding<ControllerMacroButton> {
+    private func macroButtonPicker(first: Bool) -> some View {
+        let title = settings.localized(first ? "First Button" : "Second Button")
+        let selection = buttonBinding(first: first)
+        return Picker(title, selection: selection) {
+            ForEach(ControllerMacroButton.allCases) { button in
+                Text(settings.localized(button.title)).tag(button)
+            }
+        }
+        .controllerAccessibilityOptionsPickerTarget(
+            id: "\(targetPrefix).\(first ? "first" : "second")",
+            label: title,
+            selection: selection,
+            options: ControllerMacroButton.allCases.map {
+                (id: $0, title: settings.localized($0.title))
+            }
+        )
+    }
+
+    private func buttonBinding(first: Bool) -> Binding<ControllerMacroButton> {
         Binding(
             get: {
                 let binding = settings.controllerMacroBinding(for: action)
@@ -612,15 +686,11 @@ struct ControllerMacrosSettingsView: View {
                 if first {
                     updated = ControllerMacroBinding(
                         first: selected,
-                        second: selected == current.second
-                            ? current.first
-                            : current.second
+                        second: selected == current.second ? current.first : current.second
                     )
                 } else {
                     updated = ControllerMacroBinding(
-                        first: selected == current.first
-                            ? current.second
-                            : current.first,
+                        first: selected == current.first ? current.second : current.first,
                         second: selected
                     )
                 }
@@ -676,3 +746,4 @@ struct LocalMultiplayerSettingsView: View {
         .navigationBarTitleDisplayMode(.inline)
     }
 }
+

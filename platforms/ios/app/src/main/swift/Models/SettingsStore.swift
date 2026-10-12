@@ -1420,6 +1420,17 @@ final class SettingsStore {
         suppressible: false,
         codec: .int)
     var controllerMultitapMode: Int = 0 { didSet { commit(_controllerMultitapModeConfig, controllerMultitapMode) } }
+    let _controllerMacrosEnabledConfig = Setting<Bool>(
+        section: "ARMSX2iOS/Gamepad", key: "MacrosEnabled", default: false,
+        suppressible: false, codec: .bool)
+    var controllerMacrosEnabled = false {
+        didSet {
+            commit(_controllerMacrosEnabledConfig, controllerMacrosEnabled)
+            if !suppressINIWrites {
+                synchronizeControllerMacroGameplayInput()
+            }
+        }
+    }
     let _controllerMacroQuickMenuConfig = Setting<ControllerMacroBinding>(
         section: "ARMSX2iOS/Gamepad", key: "MacroQuickMenu",
         default: ControllerMacroAction.quickMenu.defaultBinding,
@@ -2285,6 +2296,7 @@ final class SettingsStore {
             }
             _controllerMacroStartDefaultsMigration.write(true)
         }
+        controllerMacrosEnabled = _controllerMacrosEnabledConfig.load()
         controllerMacroQuickMenu = _controllerMacroQuickMenuConfig.load()
         controllerMacroSaveGameState = _controllerMacroSaveGameStateConfig.load()
         controllerMacroLoadGameState = _controllerMacroLoadGameStateConfig.load()
@@ -2571,3 +2583,4 @@ final class SettingsStore {
 
 
 }
+

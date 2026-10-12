@@ -38,6 +38,10 @@ extension SettingsStore {
     /// consumption. Only Start/Pause is published as a delayed modifier; every other gameplay
     /// input retains master's direct delivery when pressed without Start.
     func synchronizeControllerMacroGameplayInput() {
+        guard controllerMacrosEnabled else {
+            ARMSX2Bridge.configureControllerMacroInput(mask: 0, modifierMask: 0)
+            return
+        }
         var inputMask: UInt32 = 0
         var modifierMask: UInt32 = 0
         for action in ControllerMacroAction.allCases {
@@ -57,3 +61,4 @@ extension SettingsStore {
         }
     }
 }
+

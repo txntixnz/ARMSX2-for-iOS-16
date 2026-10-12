@@ -278,6 +278,7 @@ extension SettingsStore {
         invertRightStickY = false
         appLanguage = .system
         controllerMultitapMode = 0
+        controllerMacrosEnabled = false
         resetControllerMacros()
         autoOpenStikDebug = false
         jitScriptProtocol = JITScriptProtocol.defaultValue
@@ -305,3 +306,4 @@ extension SettingsStore {
         ARMSX2Bridge.flushINISettings()
     }
 }
+

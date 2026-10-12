@@ -1,4 +1,4 @@
-name: ARMSX2 iOS 16 v2.6.0 experimental compatibility test
+name: ARMSX2 iOS 16 v2.6.0 - macro switch and UI cleanup
 
 on:
   workflow_dispatch:
@@ -2262,6 +2262,18 @@ jobs:
           echo 'Remaining explicit Observation / iOS17 markers (diagnostic only):'
           grep -RInE '@Observable|@ObservationIgnored|@Bindable|MagnifyGesture\(|ContentUnavailableView\(|\.symbolEffect\(|\.contentMargins\(|\.scrollBounceBehavior\(|\.presentationCornerRadius\(' platforms/ios/app/src/main/swift || true
 
+      - name: Parse changed Swift UI sources before the full build
+        shell: bash
+        run: |
+          xcrun swiftc -frontend -parse \
+            platforms/ios/app/src/main/swift/Models/SettingsStore.swift \
+            platforms/ios/app/src/main/swift/Models/SettingsStore+Controller.swift \
+            platforms/ios/app/src/main/swift/Models/SettingsStore+Defaults.swift \
+            platforms/ios/app/src/main/swift/Models/MenuControllerInputRouter.swift \
+            platforms/ios/app/src/main/swift/Views/Settings/SettingsRootView.swift \
+            platforms/ios/app/src/main/swift/Views/Settings/GamepadSettingsView.swift \
+            platforms/ios/app/src/main/swift/Views/GameListView.swift
+
       - name: Build unsigned iOS 16 IPA
         id: build
         continue-on-error: true
@@ -2297,7 +2309,7 @@ jobs:
         if: steps.build.outcome == 'success' && steps.ios16_audit.outcome == 'success'
         uses: actions/upload-artifact@v7
         with:
-          name: ARMSX2-iOS16-v260-experimental-unsigned
+          name: ARMSX2-iOS16-v260-macros-ui-unsigned
           path: platforms/ios/build-ios-xcode/ARMSX2-iOS-unsigned.ipa
           if-no-files-found: error
 
@@ -2314,3 +2326,4 @@ jobs:
         run: |
           echo 'The experimental ARMSX2 2.6 / iOS 16 compatibility build hit a compiler/linker blocker. Download ARMSX2-iOS16-v260-experimental-build-log and inspect the first real error.' >&2
           exit 1
+

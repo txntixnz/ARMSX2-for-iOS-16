@@ -612,8 +612,46 @@ private struct SettingsDetailClearLiquidGlassModifier: ViewModifier {
     }
 }
 
+private struct SettingsMenuGroup: Identifiable {
+    let title: String
+    let panes: [SettingsPane]
+    var id: String { title }
+}
+
+private extension SettingsPane {
+    var searchKeywords: String {
+        switch self {
+        case .emulator: return "cpu ee iop vu jit speed emulation"
+        case .graphics: return "renderer resolution metal blending filtering"
+        case .framePacing: return "fps framerate frame time latency performance"
+        case .audio: return "sound volume latency"
+        case .gameController: return "gamepad mapping buttons analog stick deadzone rumble"
+        case .controllerMacros: return "shortcuts macros hotkeys fast forward save load state"
+        case .virtualPad: return "touch touchscreen controls layout"
+        case .texturePacks: return "textures replacement import"
+        case .shaders: return "effects filters post processing"
+        case .overlay: return "osd fps statistics"
+        case .appearance: return "theme colors background interface"
+        case .customSkin: return "skin touch buttons"
+        case .memoryCards: return "saves memory card"
+        case .storage: return "files cache downloads data"
+        case .network: return "dev9 hdd ethernet dns online"
+        default: return ""
+        }
+    }
+}
+
 struct SettingsRootView: View {
-    /// Real content before Language gives ScrollViewReader enough range to
+    private static let menuGroups: [SettingsMenuGroup] = [
+        .init(title: "Emulation", panes: [.emulator, .graphics, .framePacing, .audio]),
+        .init(title: "Controllers", panes: [.gameController, .controllerMacros, .virtualPad, .localMultiplayer]),
+        .init(title: "Visual Extras", panes: [.shaders, .texturePacks, .overlay]),
+        .init(title: "Storage & Saves", panes: [.memoryCards, .storage]),
+        .init(title: "Appearance & Language", panes: [.appearance, .customSkin, .appIcon, .language]),
+        .init(title: "Features", panes: [.retroAchievements, .settingsPresets]),
+        .init(title: "Advanced", panes: [.network]),
+    ]
+    /// Real content before the first settings row gives ScrollViewReader enough range to
     /// place the first focusable row inside the protected top corridor when
     /// control enters from the persistent bottom tab bar.
     private static let topNavigationFocusClearance: CGFloat = 96
@@ -625,6 +663,7 @@ struct SettingsRootView: View {
     let onNextControllerTab: @MainActor () -> Bool
     let onControllerBoundary: @MainActor (MenuControllerCommand) -> Bool
     @State private var settings = SettingsStore.shared
+    @State private var settingsSearchText = ""
     @State private var controllerDestinationEntryTask: Task<Void, Never>?
     @State private var rootNeedsControllerReentry = false
     @State private var jitAvailable = false
@@ -681,6 +720,31 @@ struct SettingsRootView: View {
         SettingsPane(rawValue: rememberedRootPaneRawValue)
     }
 
+    private func matchesSearch(_ text: String) -> Bool {
+        let query = settingsSearchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        return query.isEmpty || text.localizedStandardContains(query)
+    }
+
+    private var filteredMenuGroups: [SettingsMenuGroup] {
+        Self.menuGroups.compactMap { group in
+            let panes = group.panes.filter {
+                matchesSearch(settings.localized($0.title) + " " + $0.title + " " + $0.searchKeywords)
+                    || (!settingsSearchText.isEmpty && matchesSearch(settings.localized(group.title)))
+            }
+            return panes.isEmpty ? nil : SettingsMenuGroup(title: group.title, panes: panes)
+        }
+    }
+
+    private var filteredSupportPanes: [SettingsPane] {
+        [SettingsPane.licenses, .help].filter {
+            matchesSearch(settings.localized($0.title) + " " + $0.title)
+        }
+    }
+
+    private var showsJITSection: Bool {
+        matchesSearch("JIT StikDebug StosDebug executable memory")
+    }
+
     var body: some View {
 #if targetEnvironment(macCatalyst)
         NavigationSplitView {
@@ -734,121 +798,47 @@ struct SettingsRootView: View {
                     .listRowBackground(Color.clear)
             }
 
-            Section {
-                NavigationLink(value: SettingsPane.language) {
-                    Label(settings.localized("Language"), systemImage: "globe")
+            if controllerInput == nil {
+                HStack(spacing: 10) {
+                    Image(systemName: "magnifyingglass")
+                        .foregroundStyle(.secondary)
+                    TextField(settings.localized("Search settings"), text: $settingsSearchText)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .submitLabel(.search)
+                    if !settingsSearchText.isEmpty {
+                        Button {
+                            settingsSearchText = ""
+                        } label: {
+                            Image(systemName: "xmark.circle.fill")
+                                .foregroundStyle(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel(settings.localized("Clear search"))
+                    }
                 }
-                .controllerSettingsDestination(.language, path: $navigationPath)
-                .gameCardTintMenuBackgroundListRow(backgroundActive)
-                NavigationLink(value: SettingsPane.appearance) {
-                    Label(settings.localized("Appearance"), systemImage: "paintpalette")
-                }
-                .controllerSettingsDestination(.appearance, path: $navigationPath)
-                .gameCardTintMenuBackgroundListRow(backgroundActive)
-                NavigationLink(value: SettingsPane.appIcon) {
-                    Label(settings.localized("App Icon"), systemImage: "app.badge")
-                }
-                .controllerSettingsDestination(.appIcon, path: $navigationPath)
-                .gameCardTintMenuBackgroundListRow(backgroundActive)
-            } header: {
-                Text(settings.localized("Interface"))
-            }
-
-            Section(settings.localized("Emulation")) {
-                NavigationLink(value: SettingsPane.emulator) {
-                    Label(settings.localized("Emulator"), systemImage: "cpu")
-                }
-                .controllerSettingsDestination(.emulator, path: $navigationPath)
-                .gameCardTintMenuBackgroundListRow(backgroundActive)
-                NavigationLink(value: SettingsPane.graphics) {
-                    Label(settings.localized("Graphics"), systemImage: "paintbrush")
-                }
-                .controllerSettingsDestination(.graphics, path: $navigationPath)
-                .gameCardTintMenuBackgroundListRow(backgroundActive)
-                NavigationLink(value: SettingsPane.shaders) {
-                    Label(settings.localized("Shaders"), systemImage: "camera.filters")
-                }
-                .controllerSettingsDestination(.shaders, path: $navigationPath)
-                .gameCardTintMenuBackgroundListRow(backgroundActive)
-                NavigationLink(value: SettingsPane.texturePacks) {
-                    Label(settings.localized("Texture Packs"), systemImage: "photo.stack")
-                }
-                .controllerSettingsDestination(.texturePacks, path: $navigationPath)
-                .gameCardTintMenuBackgroundListRow(backgroundActive)
-                NavigationLink(value: SettingsPane.framePacing) {
-                    Label(settings.localized("Frame Pacing"), systemImage: "speedometer")
-                }
-                .controllerSettingsDestination(.framePacing, path: $navigationPath)
-                .gameCardTintMenuBackgroundListRow(backgroundActive)
-                NavigationLink(value: SettingsPane.audio) {
-                    Label(settings.localized("Audio"), systemImage: "speaker.wave.2")
-                }
-                .controllerSettingsDestination(.audio, path: $navigationPath)
                 .gameCardTintMenuBackgroundListRow(backgroundActive)
             }
 
-            Section(settings.localized("Input")) {
-                NavigationLink(value: SettingsPane.gameController) {
-                    Label(settings.localized("Game Controller"), systemImage: "gamecontroller")
+            ForEach(filteredMenuGroups) { group in
+                Section(settings.localized(group.title)) {
+                    ForEach(group.panes) { pane in
+                        NavigationLink(value: pane) {
+                            Label(settings.localized(pane.title), systemImage: pane.icon)
+                        }
+                        .controllerSettingsDestination(pane, path: $navigationPath)
+                        .gameCardTintMenuBackgroundListRow(backgroundActive)
+                    }
                 }
-                .controllerSettingsDestination(.gameController, path: $navigationPath)
-                .gameCardTintMenuBackgroundListRow(backgroundActive)
-                NavigationLink(value: SettingsPane.virtualPad) {
-                    Label(settings.localized("Virtual Pad"), systemImage: "hand.draw")
-                }
-                .controllerSettingsDestination(.virtualPad, path: $navigationPath)
-                .gameCardTintMenuBackgroundListRow(backgroundActive)
-                NavigationLink(value: SettingsPane.localMultiplayer) {
-                    Label(settings.localized("Local Multiplayer"), systemImage: "person.3")
-                }
-                .controllerSettingsDestination(.localMultiplayer, path: $navigationPath)
-                .gameCardTintMenuBackgroundListRow(backgroundActive)
             }
 
-            Section(settings.localized("Storage & Memory")) {
-                NavigationLink(value: SettingsPane.memoryCards) {
-                    Label(settings.localized("Memory Cards"), systemImage: "memorychip")
-                }
-                .controllerSettingsDestination(.memoryCards, path: $navigationPath)
-                .gameCardTintMenuBackgroundListRow(backgroundActive)
-                NavigationLink(value: SettingsPane.storage) {
-                    Label(settings.localized("Storage"), systemImage: "internaldrive")
-                }
-                .controllerSettingsDestination(.storage, path: $navigationPath)
-                .gameCardTintMenuBackgroundListRow(backgroundActive)
-                NavigationLink(value: SettingsPane.network) {
-                    Label(settings.localized("Network"), systemImage: "network")
-                }
-                .controllerSettingsDestination(.network, path: $navigationPath)
-                .gameCardTintMenuBackgroundListRow(backgroundActive)
+            if filteredMenuGroups.isEmpty && filteredSupportPanes.isEmpty && !showsJITSection {
+                Text(settings.localized("No matching settings."))
+                    .foregroundStyle(.secondary)
+                    .gameCardTintMenuBackgroundListRow(backgroundActive)
             }
 
-            Section(settings.localized("Features")) {
-                NavigationLink(value: SettingsPane.settingsPresets) {
-                    Label(settings.localized("Settings Presets"), systemImage: "slider.horizontal.3")
-                }
-                .controllerSettingsDestination(.settingsPresets, path: $navigationPath)
-                .gameCardTintMenuBackgroundListRow(backgroundActive)
-                NavigationLink(value: SettingsPane.retroAchievements) {
-                    Label(settings.localized("RetroAchievements"), systemImage: "trophy")
-                }
-                .controllerSettingsDestination(.retroAchievements, path: $navigationPath)
-                .gameCardTintMenuBackgroundListRow(backgroundActive)
-                NavigationLink(value: SettingsPane.customSkin) {
-                    Label(
-                        settings.localized("Custom Skin"),
-                        systemImage: "paintpalette"
-                    )
-                }
-                .controllerSettingsDestination(.customSkin, path: $navigationPath)
-                .gameCardTintMenuBackgroundListRow(backgroundActive)
-                NavigationLink(value: SettingsPane.overlay) {
-                    Label(settings.localized("Overlay (OSD)"), systemImage: "text.below.photo")
-                }
-                .controllerSettingsDestination(.overlay, path: $navigationPath)
-                .gameCardTintMenuBackgroundListRow(backgroundActive)
-            }
-
+            if showsJITSection {
             Section {
                 jitStatusRow
                     .gameCardTintMenuBackgroundListRow(backgroundActive)
@@ -866,37 +856,34 @@ struct SettingsRootView: View {
                 )
                 .gameCardTintMenuBackgroundListRow(backgroundActive)
 
-                Text(settings.localized("JIT Access means iOS currently allows executable memory. Confirm the real runtime state in-game: the OSD should show EE:JIT, IOP:JIT, and VU:JIT. Match the StikDebug/StosDebug script to the JIT Script setting in Emulator settings."))
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .gameCardTintMenuBackgroundListRow(backgroundActive)
             } header: {
                 Text(settings.localized("JIT Status"))
+            } footer: {
+                Text(settings.localized("Check EE:JIT, IOP:JIT and VU:JIT in the in-game overlay to confirm the runtime state."))
             }
 
-            Section {
-                NavigationLink(value: SettingsPane.licenses) {
-                    Label(settings.localized("Licenses & Credits"), systemImage: "doc.text")
-                }
-                .controllerSettingsDestination(.licenses, path: $navigationPath)
-                .gameCardTintMenuBackgroundListRow(backgroundActive)
             }
 
-            Section(settings.localized("About")) {
-                HStack {
-                    Text(settings.localized("Version"))
-                    Spacer()
-                    Text(SettingsStaticInfo.buildVersion)
-                        .foregroundStyle(.secondary)
-                        .font(.caption)
+            if !filteredSupportPanes.isEmpty || settingsSearchText.isEmpty {
+                Section(settings.localized("About & Help")) {
+                    if settingsSearchText.isEmpty {
+                        HStack {
+                            Text(settings.localized("Version"))
+                            Spacer()
+                            Text(SettingsStaticInfo.buildVersion)
+                                .foregroundStyle(.secondary)
+                                .font(.caption)
+                        }
+                        .gameCardTintMenuBackgroundListRow(backgroundActive)
+                    }
+                    ForEach(filteredSupportPanes) { pane in
+                        NavigationLink(value: pane) {
+                            Label(settings.localized(pane.title), systemImage: pane.icon)
+                        }
+                        .controllerSettingsDestination(pane, path: $navigationPath)
+                        .gameCardTintMenuBackgroundListRow(backgroundActive)
+                    }
                 }
-                .gameCardTintMenuBackgroundListRow(backgroundActive)
-
-                NavigationLink(value: SettingsPane.help) {
-                    Label(settings.localized("Help"), systemImage: "questionmark.circle")
-                }
-                .controllerSettingsDestination(.help, path: $navigationPath)
-                .gameCardTintMenuBackgroundListRow(backgroundActive)
             }
 
             // A real tail row extends the List's content size. Unlike a
@@ -914,6 +901,10 @@ struct SettingsRootView: View {
         // from adding a second, empty scroll range below Help.
         .contentMargins(.bottom, 0, for: .scrollContent)
         .scrollDisabled(false)
+        .scrollDismissesKeyboard(.interactively)
+        .onChange(of: controllerInput?.isControllerNavigationEnabled) { _, enabled in
+            if enabled == true { settingsSearchText = "" }
+        }
         .scrollBounceBehavior(.always)
         .scrollPosition(id: $rootScrollPositionID, anchor: .top)
         .onChange(of: rootScrollPositionID) { _, _ in
@@ -1068,22 +1059,22 @@ struct SettingsRootView: View {
             boundaryRules: [
                 ControllerAccessibilityBoundaryRule(
                     direction: .up,
-                    fromLabel: "settings.root.language",
+                    fromLabel: rootControllerTargetOrder.first ?? "settings.root.emulator",
                     requiresFreshPress: navigationPath.isEmpty
                 ),
                 ControllerAccessibilityBoundaryRule(
                     direction: .down,
-                    fromLabel: "settings.root.help",
+                    fromLabel: rootControllerTargetOrder.last ?? "settings.root.help",
                     requiresFreshPress: navigationPath.isEmpty
                 ),
             ],
-            // Wrap only after a fresh Up press at Language. Held traversal
+            // Wrap only after a fresh Up press at the first row. Held traversal
             // stops at both endpoints; Help's next Down enters the tab bar.
             directionalLinks: navigationPath.isEmpty ? [
                 ControllerAccessibilityDirectionalLink(
-                    fromLabel: "settings.root.language",
+                    fromLabel: rootControllerTargetOrder.first ?? "settings.root.emulator",
                     direction: .up,
-                    toLabel: "settings.root.help"
+                    toLabel: rootControllerTargetOrder.last ?? "settings.root.help"
                 ),
             ] : [],
             wrapsAtListEnds: !navigationPath.isEmpty,
@@ -1134,10 +1125,14 @@ struct SettingsRootView: View {
         if navigationPath.isEmpty {
             if let exactTarget = controllerInput?.rememberedNavigationFocusKey(
                 forScope: "settings.root"
-            ) {
+            ), rootControllerTargetOrder.contains(exactTarget) {
                 return exactTarget
             }
-            return rememberedRootPane.map { "settings.root.\($0.rawValue)" }
+            if let pane = rememberedRootPane {
+                let key = "settings.root.\(pane.rawValue)"
+                if rootControllerTargetOrder.contains(key) { return key }
+            }
+            return rootControllerTargetOrder.first
         }
         if navigationPath.last == .customSkin {
             return settings.localized("Automatic Download Custom Skin")
@@ -1188,7 +1183,9 @@ struct SettingsRootView: View {
             )
         }
         if pane == .controllerMacros {
-            return ControllerMacrosSettingsView.controllerTargetOrder
+            return ControllerMacrosSettingsView.controllerTargetOrder(
+                macrosEnabled: settings.controllerMacrosEnabled
+            )
         }
         if pane == .customSkin {
             // Publish the deep-link destination before the offscreen Virtual
@@ -1225,32 +1222,13 @@ struct SettingsRootView: View {
     }
 
     private var rootControllerTargetOrder: [String] {
-        var result = [
-            "settings.root.language",
-            "settings.root.appearance",
-            "settings.root.appIcon",
-            "settings.root.emulator",
-            "settings.root.graphics",
-        ]
-        result.append("settings.root.shaders")
-        result.append("settings.root.texturePacks")
-        result.append(contentsOf: [
-            "settings.root.framePacing",
-            "settings.root.audio",
-            "settings.root.gameController",
-            "settings.root.virtualPad",
-            "settings.root.localMultiplayer",
-            "settings.root.memoryCards",
-            "settings.root.storage",
-            "settings.root.network",
-            "settings.root.settingsPresets",
-            "settings.root.retroAchievements",
-            "settings.root.customSkin",
-            "settings.root.overlay",
-            "settings.root.open-stik-debug",
-            "settings.root.licenses",
-            "settings.root.help",
-        ])
+        var result = filteredMenuGroups.flatMap { group in
+            group.panes.map { "settings.root.\($0.rawValue)" }
+        }
+        if showsJITSection {
+            result.append("settings.root.open-stik-debug")
+        }
+        result += filteredSupportPanes.map { "settings.root.\($0.rawValue)" }
         return result
     }
 
@@ -1754,3 +1732,4 @@ private struct DNSHost: Identifiable, Equatable {
     var address: String
     var enabled: Bool
 }
+
