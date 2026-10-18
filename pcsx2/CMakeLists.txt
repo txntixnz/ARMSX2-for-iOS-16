@@ -100,6 +100,11 @@ set(pcsx2Sources
 	IopHw.cpp
 	IopIrq.cpp
 	IopMem.cpp
+	IopThread/IopChannels.cpp
+	IopThread/IopPlacement.cpp
+	IopThread/IopThread.cpp
+	IopThread/IopThreadMode.cpp
+	IopThread/IopThreadVm.cpp
 	PINE.cpp
 	Mdec.cpp
 	Memory.cpp
@@ -195,6 +200,15 @@ set(pcsx2Headers
 	IopGte.h
 	IopHw.h
 	IopMem.h
+	IopThread/IopChannels.h
+	IopThread/EeBridge.h
+	IopThread/IopBridge.h
+	IopThread/IopPlacement.h
+	IopThread/IopThread.h
+	IopThread/IopThreadMode.h
+	IopThread/IopThreadVm.h
+	IopThread/OwnerAsserts.h
+	IopThread/SharedWord.h
 	LayeredSettingsInterface.h
 	PINE.h
 	Mdec.h
@@ -1419,6 +1433,16 @@ set(pcsx2arm64Sources
 	arm64/Vif_UnpackNEON.cpp
 	arm64/RecStubs.cpp
 	arm64/microVU-arm64.cpp
+	arm64/vuaot/VuAotBackground.cpp
+	arm64/vuaot/VuAotDecode.cpp
+	arm64/vuaot/VuAotGraph.cpp
+	arm64/vuaot/VuAotIR.cpp
+	arm64/vuaot/VuAotLower.cpp
+	arm64/vuaot/VuAotMvuTrace.cpp
+	arm64/vuaot/VuAotPersist.cpp
+	arm64/vuaot/VuAotPipe.cpp
+	arm64/vuaot/VuAotTier.cpp
+	arm64/vuaot/VuAotRegion.cpp
 	x86/iR5900Analysis.cpp  # arch-neutral EE instruction-liveness analysis, shared with the x86 build
 	)
 
@@ -1434,8 +1458,20 @@ set(pcsx2arm64Headers
 	arm64/microVU_Persist-arm64.inl
 	arm64/microVU_ProgCache-arm64.h
 	arm64/microVU_ProgCache-arm64.inl
+	arm64/vuaot/microVU_VuAot-arm64.inl
 	arm64/microVU_Misc-arm64.h
 	arm64/VuFmacFlags-arm64.h
+	arm64/vuaot/VuAotBackground.h
+	arm64/vuaot/VuAotDecode.h
+	arm64/vuaot/VuAotPersist.h
+	arm64/vuaot/VuAotGraph.h
+	arm64/vuaot/VuAotIR.h
+	arm64/vuaot/VuAotLive.h
+	arm64/vuaot/VuAotLower.h
+	arm64/vuaot/VuAotMvuTrace.h
+	arm64/vuaot/VuAotPipe.h
+	arm64/vuaot/VuAotTier.h
+	arm64/vuaot/VuAotRegion.h
 )
 
 # Mobile (arm64) platform sources, relocated from the former android/iOS core

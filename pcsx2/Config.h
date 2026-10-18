@@ -187,6 +187,7 @@ enum class SpeedHack
 	InstantVU1,
 	MTVU,
 	EECycleRate,
+	IOPThread,
 	MaxCount,
 };
 
@@ -793,10 +794,27 @@ struct Pcsx2Config
 
 		// Cache compiled VU micro-programs to disk and reload them across
 		// sessions to cut recompilation stutter on later runs. arm64-only;
-		// no-op on x86.
+		// no-op on x86. Read through UseVUProgramCache(), not directly: the
+		// cache is also on whenever EnableVUAot is.
 		bool
 			EnableVUProgramCache : 1;
+
+		// vu-aot, the whole-program VU1 compiler (pcsx2/arm64/vuaot/): programs
+		// that run often enough are recompiled above microVU, which stays the
+		// fallback at every block boundary. arm64-only; no-op on x86. Default
+		// on. It turns the VU program cache on (UseVUProgramCache()), which
+		// keeps the compiled code on disk for the next session.
+		bool
+			EnableVUAot : 1;
 		BITFIELD_END
+
+		// Whether the on-disk VU program cache runs: EnableVUProgramCache, or
+		// EnableVUAot (owner decision 2026-10-15: vu-aot is bound to the cache,
+		// there is no separate switch). Every reader of the cache setting goes
+		// through this. Both bits are part of the CPU options, so changing
+		// either one resets the VU recompilers (VMManager::CheckForCPUConfigChanges),
+		// and the reset re-reads this.
+		bool UseVUProgramCache() const { return EnableVUProgramCache || EnableVUAot; }
 
 		RecompilerOptions();
 		void ApplySanityCheck();
@@ -1387,11 +1405,19 @@ struct Pcsx2Config
 			WaitLoop : 1, // enables constant loop detection and fast-forwarding
 			vuFlagHack : 1, // microVU specific flag hack
 			vuThread : 1, // Enable Threaded VU1
-			vu1Instant : 1; // Enable Instant VU1 (Without MTVU only)
+			vu1Instant : 1, // Enable Instant VU1 (Without MTVU only)
+			// JIT code tests vuThread by its bit position in this word (microVU-arm64.cpp), so the
+			// flags below stay after every older one.
+			iopThread : 1, // Run the IOP on its own thread (IopThread::ResolveMode decides whether it can)
+			iopThreadLockstep : 1; // With iopThread: strict turns with the EE instead of concurrent. Testing only, no UI.
 		BITFIELD_END
 
 		s8 EECycleRate; // EE cycle rate selector (1.0, 1.5, 2.0)
 		u8 EECycleSkip; // EE Cycle skip factor (0, 1, 2, or 3)
+
+		// The IOP thread's lag bound L, in EE cycles. Clamped by IopThread::ClampLag when it is read
+		// from the settings file. An advanced setting: INI only, never in a simple settings view.
+		int iopThreadLag;
 
 		SpeedhackOptions();
 		void LoadSave(SettingsWrapper& conf);

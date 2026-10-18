@@ -35,6 +35,7 @@ add_pcsx2_test(recompiler_tests
 	iop_cop0_exception_tests.cpp
 	iop_irx_hle_tests.cpp
 	arm64_baseblocks_link_tests.cpp
+	arm64_alloc_thread_tests.cpp
 	ee_rec_alu_tests.cpp
 	ee_rec_alu64_tests.cpp
 	ee_rec_fuzz_tests.cpp
@@ -96,6 +97,7 @@ add_pcsx2_test(recompiler_tests
 	vu0_clamp_modes_tests.cpp
 	vu_ftoi_saturation_tests.cpp
 	vu_madda_acc_lane_tests.cpp
+	vu_single_lane_inplace_tests.cpp
 	vu_ss_clamp_lane_tests.cpp
 	vu_clip_flag_tests.cpp
 	vu_clamp_consts_residency_tests.cpp
@@ -108,6 +110,7 @@ add_pcsx2_test(recompiler_tests
 	vu_minmax_order_tests.cpp
 	vu_pq_boundary_tests.cpp
 	vu_saturated_q_consumer_tests.cpp
+	vu_branch_condition_tests.cpp
 	vu_branch_terminator_tests.cpp
 	vu_overflow_hack_tests.cpp
 	vu_mac_flag_pack_tests.cpp
@@ -127,18 +130,30 @@ add_pcsx2_test(recompiler_tests
 	ee_vu1_vif_dispatch_tests.cpp
 	vu_capture_format_tests.cpp
 	vu_replay_tests.cpp
-	mvu_observed_entries_tests.cpp
 	mvu_cache_exhaustion_tests.cpp
 	mvu_lpstate_invariant_tests.cpp
+	mvu_clear_occupied_tests.cpp
+	mvu_block_list_tests.cpp
+	mvu_empty_field_tests.cpp
+	mvu_vi_backup_tests.cpp
+	mvu_ilw_load_use_tests.cpp
+	vu_end_drain_console_tests.cpp
 	mvu_resume_dispatch_tests.cpp
 	mvu_spin_ff_tests.cpp
 	mvu_contentmap_drift_tests.cpp
 	mvu_lane_fmul_fold_tests.cpp
 	mvu_abi_digest_tests.cpp
 	mvu_persist_roundtrip_tests.cpp
+	mvu_persist_relocation_tests.cpp
+	mvu_block_sharing_cycles_tests.cpp
 	mvu_progcache_disk_tests.cpp
 	mvu_waitmtvu_stub_tests.cpp
 	mvu_ebit_exit_tests.cpp
+	vuaot_frontend_tests.cpp
+	vuaot_live_tests.cpp
+	vuaot_lowering_tests.cpp
+	vuaot_persist_tests.cpp
+	mvu_ebit_condbranch_status_tests.cpp
 	mvu_options_sentinel_tests.cpp
 	mvu_model_stub_tests.cpp
 	model_call_contract_tests.cpp

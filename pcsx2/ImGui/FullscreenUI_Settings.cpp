@@ -2630,6 +2630,14 @@ void FullscreenUI::DrawEmulationSettingsPage()
 		ee_cycle_skip_settings, std::size(ee_cycle_skip_settings), true);
 	DrawToggleSetting(bsi, FSUI_ICONSTR(ICON_FA_USERS, "Enable Multithreaded VU1 (MTVU)"),
 		FSUI_CSTR("Generally a speedup on CPUs with 4 or more cores. Safe for most games, but a few are incompatible and may hang."), "EmuCore/Speedhacks", "vuThread", false);
+	DrawToggleSetting(bsi, FSUI_ICONSTR(ICON_FA_USERS, "Enable IOP Thread"),
+		FSUI_CSTR("Runs the PS2's I/O processor (sound, disc, controllers and memory cards) on its own thread. A speedup on CPUs with at least four fast cores. It turns itself off on CPUs without spare cores."),
+		"EmuCore/Speedhacks", "iopThread", false);
+#ifdef ARCH_ARM64 // vu-aot is part of the ARM64 recompilers only
+	DrawToggleSetting(bsi, FSUI_ICONSTR(ICON_FA_MICROCHIP, "Enable VU1 Ahead-of-Time Compiler"),
+		FSUI_CSTR("Optimises VU1 programs in the background and keeps the compiled VU code on disk, so later launches start with it. Faster in games that spend much of their time in VU1. Turning it off clears the compiled cache."),
+		"EmuCore/CPU/Recompiler", "EnableVUAot", true);
+#endif
 	DrawToggleSetting(bsi, FSUI_ICONSTR(ICON_FA_LOCATION_PIN_LOCK, "Enable Thread Pinning"),
 		FSUI_CSTR("Pins emulation threads to CPU cores to potentially improve performance/frame time variance."),
 		"EmuCore",
@@ -6124,6 +6132,8 @@ TRANSLATE_NOOP("FullscreenUI", "System Settings");
 TRANSLATE_NOOP("FullscreenUI", "Underclocks or overclocks the emulated Emotion Engine CPU.");
 TRANSLATE_NOOP("FullscreenUI", "Makes the emulated Emotion Engine skip cycles. Helps a small subset of games like SOTC. Most of the time it's harmful to performance.");
 TRANSLATE_NOOP("FullscreenUI", "Generally a speedup on CPUs with 4 or more cores. Safe for most games, but a few are incompatible and may hang.");
+TRANSLATE_NOOP("FullscreenUI", "Runs the PS2's I/O processor (sound, disc, controllers and memory cards) on its own thread. A speedup on CPUs with at least four fast cores. It turns itself off on CPUs without spare cores.");
+TRANSLATE_NOOP("FullscreenUI", "Optimises VU1 programs in the background and keeps the compiled VU code on disk, so later launches start with it. Faster in games that spend much of their time in VU1. Turning it off clears the compiled cache.");
 TRANSLATE_NOOP("FullscreenUI", "Pins emulation threads to CPU cores to potentially improve performance/frame time variance.");
 TRANSLATE_NOOP("FullscreenUI", "Enables loading cheats from pnach files.");
 TRANSLATE_NOOP("FullscreenUI", "Allows games and homebrew to access files / folders directly on the host computer.");
@@ -6783,6 +6793,8 @@ TRANSLATE_NOOP("FullscreenUI", "Slow-Motion Speed");
 TRANSLATE_NOOP("FullscreenUI", "EE Cycle Rate");
 TRANSLATE_NOOP("FullscreenUI", "EE Cycle Skipping");
 TRANSLATE_NOOP("FullscreenUI", "Enable Multithreaded VU1 (MTVU)");
+TRANSLATE_NOOP("FullscreenUI", "Enable IOP Thread");
+TRANSLATE_NOOP("FullscreenUI", "Enable VU1 Ahead-of-Time Compiler");
 TRANSLATE_NOOP("FullscreenUI", "Enable Thread Pinning");
 TRANSLATE_NOOP("FullscreenUI", "Enable Cheats");
 TRANSLATE_NOOP("FullscreenUI", "Enable Host Filesystem");
