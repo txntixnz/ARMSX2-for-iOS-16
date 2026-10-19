@@ -251,6 +251,11 @@ namespace VMManager
 	/// Returns true if the target speed is being synchronized with the host's refresh rate.
 	bool IsTargetSpeedAdjustedToHost();
 
+	/// Returns true when pacing comes from the host's vsync rather than the limiter's
+	/// sleep. Throttle() returns immediately in that case, so there is no frame deadline
+	/// to measure work against.
+	bool IsUsingVSyncForTiming();
+
 	/// Returns the current frame rate of the virtual machine.
 	float GetFrameRate();
 
@@ -262,6 +267,9 @@ namespace VMManager
 
 	/// Runs the virtual machine for the specified number of video frames, and then automatically pauses.
 	void FrameAdvance(u32 num_frames = 1);
+
+	/// Returns true while a frame-advance request still has frames left to run.
+	bool IsFrameAdvancing();
 
 	/// Changes the disc in the virtual CD/DVD drive. Passing an empty will remove any current disc.
 	/// Returns false if the new disc can't be opened.
@@ -407,6 +415,11 @@ namespace VMManager
 		/// now, for tools that move the MTGS thread themselves. Returns the mask applied.
 		u64 PlaceGSBackThreadNearGSThread();
 
+		/// Whether the placement the GS back thread would get now, given where the MTGS, EE, VU and IOP threads
+		/// are pinned, includes a processor one of them is pinned to. False when the threads are not pinned (the
+		/// scheduler decides, and there is nothing to say) and on platforms with no placement.
+		bool GSBackThreadWouldShareBusyCore();
+
 		/// Returns a list of processors in the system, suitable for pinning for the software renderer.
 		const std::vector<u32>& GetSoftwareRendererProcessorList();
 
@@ -425,6 +438,8 @@ namespace VMManager
 
 		const std::string& GetELFOverride();
 		bool IsExecutionInterrupted();
+		/// True while FrameAdvance() has frames left to run.
+		bool IsFrameAdvancing();
 		/// GetState() without the acquire, for the EE event test, which puts an acquire fence after it where it
 		/// relies on the value (see _cpuEventTest_Shared).
 		VMState GetStateForEventTest();

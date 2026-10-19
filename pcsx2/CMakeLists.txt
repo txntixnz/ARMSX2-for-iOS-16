@@ -67,6 +67,10 @@ set(pcsx2Sources
 	Arcade/ArcadeFiles.cpp
 	Arcade/ArcadeInput.cpp
 	Arcade/ArcadeSetup.cpp
+	AutoTune/AutoTuneApplier.cpp
+	AutoTune/AutoTuneController.cpp
+	AutoTune/AutoTuneSampler.cpp
+	AutoTune/AutoTuneStore.cpp
 	Autosave.cpp
 	BuildVersion.cpp
 	Cache.cpp
@@ -74,6 +78,9 @@ set(pcsx2Sources
 	COP2.cpp
 	Counters.cpp
 	Dmac.cpp
+	EECycleRate.cpp
+	EECycleRateController.cpp
+	EECycleRateSampler.cpp
 	GameDatabase.cpp
 	Elfheader.cpp
 	FW.cpp
@@ -172,6 +179,10 @@ set(pcsx2Headers
 	Arcade/ArcadeFiles.h
 	Arcade/ArcadeInput.h
 	Arcade/ArcadeSetup.h
+	AutoTune/AutoTuneApplier.h
+	AutoTune/AutoTuneController.h
+	AutoTune/AutoTuneSampler.h
+	AutoTune/AutoTuneStore.h
 	Autosave.h
 	BuildVersion.h
 	Cache.h
@@ -180,6 +191,9 @@ set(pcsx2Headers
 	COP0.h
 	Counters.h
 	Dmac.h
+	EECycleRate.h
+	EECycleRateController.h
+	EECycleRateSampler.h
 	EeFpuFormat.h
 	EeFpuModel.h
 	GameDatabase.h

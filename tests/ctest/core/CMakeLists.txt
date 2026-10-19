@@ -5,6 +5,12 @@ add_pcsx2_test(core_test
 	vuaot_setting_tests.cpp
 	ee_fpu_reloc_tests.cpp
 	patch_tests.cpp
+	autotune_applier_tests.cpp
+	autotune_controller_tests.cpp
+	autotune_sampler_tests.cpp
+	autotune_settings_tests.cpp
+	autotune_store_tests.cpp
+	autotune_trace_tests.cpp
 	iop_fingerprint_tests.cpp
 	iop_thread_mode_tests.cpp
 	iop_thread_placement_tests.cpp
@@ -33,6 +39,9 @@ add_pcsx2_test(core_test
 	onscreen_keyboard_tests.cpp
 	onscreen_keyboard_ui_tests.cpp
 	texture_upscale_setting_tests.cpp
+	ee_cycle_rate_controller_tests.cpp
+	ee_cycle_rate_eligibility_tests.cpp
+	ee_cycle_rate_sampler_tests.cpp
 	MockMemoryInterface.h
 	StubHost.cpp
 )

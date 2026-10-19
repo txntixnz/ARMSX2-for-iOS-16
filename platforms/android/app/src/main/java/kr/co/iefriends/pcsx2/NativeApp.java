@@ -486,6 +486,33 @@ public class NativeApp {
 	/** Re-read the running game's INI into the core's game layer after rewriting it, so the
 	 *  commit that follows applies what the file says now. Applies nothing itself. */
 	public static native void reloadGameSettingsLayer();
+
+	/** What auto-tune changed for a game, one readable line each, then the steps it tried without
+	 *  benefit. Empty when it changed nothing. [serial] names the game: the running one, else the
+	 *  one settings file on disk for that serial (blank = the running game). */
+	public static native String[] autoTuneDescribe(String serial);
+	/** Puts back what auto-tune changed in the game's settings file and forgets what it learned
+	 *  (applied on the CPU thread when the game is running). Returns null when the game has no
+	 *  file, else {hadRecord "1"/"0"} followed by kind, section, key, value for each key the record
+	 *  named. Kind "restored": put back, the value is what the file holds again (null: the key was
+	 *  deleted). Kind "absent": left alone because the key is not in the file, the value is what
+	 *  auto-tune wrote. Kind "changed": left alone because the file holds another value, the value
+	 *  is what auto-tune wrote. The app must do the same to its own copy of the game's settings
+	 *  (AutoTuneStore.applyReset). */
+	public static native String[] autoTuneReset(String serial);
+
+	/** Called from native (the CPU thread) after auto-tune moved one setting into the game's
+	 *  settings file. [serial] is the running disc's serial, empty for homebrew. The app keeps its
+	 *  own copy of per-game settings and regenerates the file from it, so the value is written into
+	 *  that copy (AutoTuneStore.onCommitted). Nothing may escape: native makes no exception check
+	 *  beyond clearing one. */
+	public static void onAutoTuneCommitted(String serial, String section, String key, String value) {
+		try {
+			com.armsx2.config.AutoTuneStore.INSTANCE.onCommitted(serial, section, key, value);
+		} catch (Throwable t) {
+			android.util.Log.e("ARMSX2", "onAutoTuneCommitted failed: " + section + "/" + key, t);
+		}
+	}
 	/** What the game database sets for a serial: one line per setting a per-game key can claim,
 	 *  "name TAB value TAB flags TAB section/key|section/key". See GameDbOverrides. */
 	public static native String getGameDbEntries(String serial);

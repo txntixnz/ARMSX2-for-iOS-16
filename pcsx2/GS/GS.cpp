@@ -16,6 +16,7 @@
 #include "Host.h"
 #include "Input/InputManager.h"
 #include "MTGS.h"
+#include "PerformanceMetrics.h"
 #include "pcsx2/GS.h"
 #include "GS/Renderers/Common/GSBackThreadPolicy.h"
 #include "GS/Renderers/Common/GSCopyRoadBlendingPolicy.h"
@@ -72,6 +73,9 @@ Pcsx2Config::GSOptions GSConfig;
 
 static GSRendererType GSCurrentRenderer;
 static bool GSCurrentPresenterOffsetsRead;
+// The API of the device that is open, kept apart from the device itself (which the GS thread creates and destroys)
+// so another thread can ask.
+static std::atomic<RenderAPI> GSCurrentRenderAPI{RenderAPI::None};
 
 GSRendererType GSGetCurrentRenderer()
 {
@@ -82,6 +86,11 @@ bool GSIsHardwareRenderer()
 {
 	// Null gets flagged as hw.
 	return (GSCurrentRenderer != GSRendererType::SW);
+}
+
+RenderAPI GSGetCurrentRenderAPI()
+{
+	return GSCurrentRenderAPI.load(std::memory_order_relaxed);
 }
 
 bool GSPresenterOffsetsFramebufferRead()
@@ -193,11 +202,16 @@ static bool OpenGSDevice(GSRendererType renderer, bool clear_state_on_fail, bool
 		ImGuiManager::Shutdown(clear_state_on_fail);
 		g_gs_device->Destroy();
 		g_gs_device.reset();
+		GSCurrentRenderAPI.store(RenderAPI::None, std::memory_order_relaxed);
 		Host::ReleaseRenderWindow();
 		return false;
 	}
 
-	if (!g_gs_device->SetGPUTimingEnabled(true))
+	GSCurrentRenderAPI.store(new_api, std::memory_order_relaxed);
+
+	const bool gpu_timing = g_gs_device->SetGPUTimingEnabled(true);
+	PerformanceMetrics::SetGPUTimerSupported(gpu_timing);
+	if (!gpu_timing)
 		GSConfig.OsdShowGPU = false;
 	if (GSConfig.OsdShowGPUStats && !g_gs_device->SetGPUPipelineStatisticsEnabled(true))
 		GSConfig.OsdShowGPUStats = false;
@@ -216,6 +230,7 @@ static void CloseGSDevice(bool clear_state)
 	ImGuiManager::Shutdown(clear_state);
 	g_gs_device->Destroy();
 	g_gs_device.reset();
+	GSCurrentRenderAPI.store(RenderAPI::None, std::memory_order_relaxed);
 }
 
 static void GSClampUpscaleMultiplier(Pcsx2Config::GSOptions& config)
