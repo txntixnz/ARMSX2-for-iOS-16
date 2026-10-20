@@ -1160,8 +1160,11 @@ fun HomeScreen(
                 val addToHomeFailed = str("games.addToHome.unsupported")
                 GameMenuAction("📌", str("games.addToHome"), "game-menu.pin") {
                     menuGame = null
-                    if (!com.armsx2.HomeShortcuts.pin(context, game))
-                        Toast.makeText(context, addToHomeFailed, Toast.LENGTH_LONG).show()
+                    // pin() fetches the cover first, normally from the library's image cache.
+                    scope.launch {
+                        if (!com.armsx2.HomeShortcuts.pin(context, game))
+                            Toast.makeText(context, addToHomeFailed, Toast.LENGTH_LONG).show()
+                    }
                 }
                 // Only offered when the game is actually in Recently Played — this drops
                 // just this one entry, unlike the library-wide "Show Recently Played" toggle.
@@ -2024,6 +2027,18 @@ private fun GameListCard(game: GameInfo, selected: Boolean, onClick: () -> Unit,
             Spacer(Modifier.width(12.dp))
             Column(Modifier.weight(1f)) {
                 Text(game.displayTitle(EnglishTitles.enabled.value), style = MaterialTheme.typography.titleSmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                // The file name, so two dumps of one game (a hack, a beta, another revision) read
+                // differently. Left out when it only repeats the title, as for a game named after
+                // its file.
+                game.fileName?.takeIf { !it.substringBeforeLast('.').equals(game.title, ignoreCase = true) }?.let { name ->
+                    Text(
+                        name,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
                 Spacer(Modifier.height(5.dp))
                 GameMetadata(game)
             }

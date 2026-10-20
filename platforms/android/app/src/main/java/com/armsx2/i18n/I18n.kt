@@ -542,6 +542,8 @@ private val BASE_EN: Map<String, String> = mapOf(
     "audio.spu2Simd.description" to "NEON fast path for reverb audio processing. Frees up CPU, which can help performance on CPU-limited devices. Off (default) uses the standard path with unchanged audio. Reboot the game to switch.",
     "audio.openSles.label" to "OpenSL ES audio (compatibility)",
     "audio.openSles.description" to "Uses the older OpenSL ES output path instead of AAudio. A compatibility fallback for devices where the default audio glitches, crackles, or won't initialize, at the cost of slightly higher latency. Most devices should leave this off (AAudio low-latency). Applies instantly.",
+    "audio.recordingCompatible.label" to "Recording-compatible audio",
+    "audio.recordingCompatible.description" to "Routes audio through the system mixer so screen recorders can capture it. Without this, recordings can come out silent even though the audio plays normally on the device. Adds a little latency, so leave it off unless you are recording.",
     "audio.lightweight.label" to "Lightweight audio (skip reverb)",
     "audio.lightweight.description" to "Skips SPU2 reverb processing to save CPU on low-end devices. This removes all echo and spatial reverb (caves, halls and ambience sound flat), so only enable it if you need the extra performance and SPU2 SIMD audio isn't enough. Off (default) plays full audio. Applies instantly.",
     // --- Recompiler (JIT) tab ---
@@ -1152,6 +1154,8 @@ private val BASE_EN: Map<String, String> = mapOf(
     "pad.touchPlayer.label" to "Touch controls play as",
     "pad.touchPlayer.description" to "Which player the on-screen controls are. Player 2 lets one person play on a controller and another on the touch screen. Restart the game to apply.",
     "pad.multiTouch.description" to "How far from a button's center a touch still counts as a press, so you can hit two adjacent on-screen buttons at once. Higher = more reach (easier rolls and combos).",
+    "pad.tightShoulders.label" to "Tight L1/L2/R1/R2 touch areas",
+    "pad.tightShoulders.description" to "L1, L2, R1 and R2 respond only to touches on the button itself, not the space around it, so they take up less of the screen.",
     "pad.onScreenControls.label" to "On-screen controls",
     "pad.player1" to "Player 1",
     "pad.player2" to "Player 2",
