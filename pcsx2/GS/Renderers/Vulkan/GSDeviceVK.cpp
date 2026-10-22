@@ -4104,7 +4104,7 @@ GSSelfReadRoadDecision GSDeviceVK::ResolveSelfReadRoad()
 	road_inputs.driver_orders_declared_loop = GetMobileDriverProfile().orders_declared_feedback_loop &&
 		(!order_on_request || m_optional_extensions.vk_ext_rasterization_order_attachment_access);
 	// The database saying this part belongs on the declared loop with our own barriers kept: Turnip on
-	// Adreno 730 and up, where the copy road renders wrong.
+	// Adreno 730 and up and on the 722, where the copy road renders wrong.
 	road_inputs.driver_prefers_declared_loop_with_barriers =
 		GetMobileDriverProfile().prefers_declared_loop_with_barriers;
 	road_inputs.override_texture_barriers = GSConfig.OverrideTextureBarriers;
