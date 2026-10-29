@@ -323,10 +323,12 @@ if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
 		Runtime/PlaySoundAsync.mm
 		Runtime/SceneDelegate.mm
 	)
+	file(GLOB IOS_BRIDGE_SOURCES CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/Bridge/*.mm)
+	armsx2_require_files(IOS_BRIDGE_SOURCES)
 	# Only the bridge. The files in IOS_RUNTIME_SOURCES still release by hand, and
 	# test_ios_airplay.py pins one of those lines out of SceneDelegate.mm.
-	set_source_files_properties(Bridge/ARMSX2Bridge.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
-	add_executable(ARMSX2iOS ${IOS_RUNTIME_SOURCES} Bridge/ARMSX2Bridge.mm ${SWIFT_SOURCES})
+	set_source_files_properties(${IOS_BRIDGE_SOURCES} PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+	add_executable(ARMSX2iOS ${IOS_RUNTIME_SOURCES} ${IOS_BRIDGE_SOURCES} ${SWIFT_SOURCES})
 	set_target_properties(ARMSX2iOS PROPERTIES
 		MACOSX_BUNDLE TRUE
 		MACOSX_BUNDLE_GUI_IDENTIFIER "${ARMSX2_BUNDLE_IDENTIFIER}"
@@ -512,6 +514,17 @@ if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
 		COMMENT "Building the core in build/core-${ARMSX2_CORE_PLATFORM}"
 	)
 	add_dependencies(ARMSX2iOS armsx2_core)
+
+	find_program(ARMSX2_PYTHON3 python3)
+	if(NOT ARMSX2_PYTHON3)
+		message(FATAL_ERROR "python3 not found; the bridge method check needs it")
+	endif()
+	# A method the header declares but no bridge file implements only fails at run time.
+	add_custom_command(TARGET ARMSX2iOS POST_BUILD
+		COMMAND ${ARMSX2_PYTHON3} ${CMAKE_CURRENT_SOURCE_DIR}/scripts/check_bridge_methods.py
+			${CMAKE_CURRENT_SOURCE_DIR}/Bridge/ARMSX2Bridge.h $<TARGET_FILE:ARMSX2iOS>
+		VERBATIM
+	)
 
 	target_compile_options(ARMSX2iOS PRIVATE $<$<COMPILE_LANGUAGE:C,CXX,OBJC,OBJCXX>:-pipe>)
 	# With OBJCXX not enabled, CMake builds this target's .mm files as CXX. The core keeps its own warnings.
