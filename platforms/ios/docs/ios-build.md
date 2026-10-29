@@ -7,20 +7,21 @@ can become stale quickly.
 Swift UI sources live in:
 
 ```sh
-app/src/main/swift
+platforms/ios/Swift
 ```
 
 The iOS CMake entry point lives in:
 
 ```sh
-app/src/main/cpp/CMakeLists.txt
+platforms/ios/CMakeLists.txt
 ```
 
 ## Requirements
 
 - macOS with Xcode installed
 - Xcode command line tools selected with `xcode-select`
-- CMake 3.16 or newer
+- CMake 4.4 or newer
+- Ninja (`brew install ninja`)
 - A recursive clone with submodules initialized
 
 ## Clone
@@ -40,13 +41,13 @@ git submodule update --init --recursive
 This creates:
 
 ```sh
-build-ios-xcode/ARMSX2iOS.xcodeproj
+build/device/ARMSX2iOS.xcodeproj
 ```
 
 Open it with:
 
 ```sh
-open build-ios-xcode/ARMSX2iOS.xcodeproj
+open build/device/ARMSX2iOS.xcodeproj
 ```
 
 Use the `ARMSX2iOS` scheme.
@@ -62,12 +63,12 @@ For sideloading or external resigning:
 The IPA is written to:
 
 ```sh
-build-ios-xcode/ARMSX2-iOS-unsigned.ipa
+build/device/ARMSX2-iOS-unsigned.ipa
 ```
 
-For a quicker development build, `./scripts/build-ios-ipa.sh --fast` turns off
-PCSX2 core LTO and compiles the Swift UI at `-Onone`. It builds in
-`build-ios-fast-xcode` and writes `ARMSX2-iOS-development.ipa` there.
+For a quicker development build, `./scripts/build-ios-ipa.sh --fast` compiles
+the Swift UI at `-Onone`. It builds in `build/device-fast`, writes
+`ARMSX2-iOS-development.ipa` there and shares `build/core-device`.
 
 ## Automatic Signing
 
@@ -81,9 +82,32 @@ TEAM_ID=YOUR_APPLE_TEAM_ID BUNDLE_ID=com.your.bundle.id ./scripts/generate-ios-x
 Then open the generated project in Xcode and build the `ARMSX2iOS` scheme for an
 iOS device.
 
+## The Prebuilt Core
+
+The PCSX2 core, `common/` and the 3rdparty libraries are not part of the Xcode
+project. They build with Ninja into `build/core-sim`, `build/core-device` and
+`build/core-catalyst`, and the app links them from there. Every app build runs
+`scripts/build-ios-core.sh <platform>` first, which does nothing when no core
+source changed.
+
+The core is always a Release build with debug info and no LTO, one per platform
+for every app configuration. Product > Clean Build Folder cleans the app only.
+To rebuild the core from scratch, remove its directory:
+
+```sh
+rm -rf build/core-device
+```
+
+Core files are not in the Xcode project, so to set a breakpoint in one, open it
+with File > Open, or use `breakpoint set -f <file> -l <line>` in lldb. Expect
+some variables to be optimised out.
+
+The project no longer regenerates itself. Re-run the generate script after
+adding or removing Swift files or shader presets.
+
 ## Notes
 
-- `build-ios-xcode/` is generated output and should not be committed.
+- `build/` is generated output and should not be committed.
 - The build target is iOS device arm64 by default.
 - Minimum iOS version is 17.4.
 - JIT availability depends on how the app is signed and launched. Unsigned IPAs

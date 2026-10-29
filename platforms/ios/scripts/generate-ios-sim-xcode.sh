@@ -10,8 +10,8 @@ set -euo pipefail
 # compile-guarded by PCSX2_HAS_METALFX=0 (see GSDeviceMTL.h).
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-SOURCE_DIR="$ROOT_DIR/app/src/main/cpp"
-BUILD_DIR="${BUILD_DIR:-$ROOT_DIR/build-ios-sim-xcode}"
+SOURCE_DIR="$ROOT_DIR"
+BUILD_DIR="${BUILD_DIR:-$ROOT_DIR/build/sim}"
 BUNDLE_ID="${BUNDLE_ID:-com.armsx2.ios}"
 
 if ! command -v cmake >/dev/null 2>&1; then
@@ -37,6 +37,9 @@ Generated iOS Simulator Xcode project:
 
 Open in Xcode:
   open "$BUILD_DIR/ARMSX2iOS.xcodeproj"
+
+Prebuilt core (Ninja, rebuilt before every app build when its sources change):
+  $ROOT_DIR/build/core-sim
 
 Simulator build:
   xcodebuild -project "$BUILD_DIR/ARMSX2iOS.xcodeproj" -scheme ARMSX2iOS -configuration Debug -sdk iphonesimulator build
