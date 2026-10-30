@@ -1,12 +1,18 @@
 package com.armsx2.ui.news
 
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Box
+import androidx.compose.ui.layout.findRootCoordinates
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.positionInWindow
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -40,6 +46,7 @@ import com.armsx2.ui.common.ArmsBackdrop
 import com.armsx2.ui.common.ArmsTopBar
 import com.armsx2.ui.common.GlassPanel
 import com.armsx2.ui.common.RoundAction
+import com.armsx2.ui.settings.SettingsControllerNav
 import com.armsx2.ui.settings.controllerFocusable
 
 /**
@@ -58,11 +65,11 @@ fun NewsScreen(onBack: () -> Unit, viewModel: NewsViewModel = viewModel()) {
         Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
             ArmsTopBar(
                 title = str("news.title"),
-                leading = { RoundAction("←", str("action.back"), onBack) },
+                leading = { RoundAction("←", str("action.back"), onBack, controllerId = "news.back") },
                 actions = {
                     // Named, not a trailing lambda: RoundAction's last parameter is glyphColor, so
                     // a trailing lambda binds there rather than to onClick.
-                    RoundAction("⟳", str("news.refresh"), onClick = { viewModel.load(force = true) })
+                    RoundAction("⟳", str("news.refresh"), onClick = { viewModel.load(force = true) }, controllerId = "news.refresh")
                 },
             )
 
@@ -148,22 +155,57 @@ private fun ReleaseContributors(people: List<News.Contributor>) {
     }
 }
 
+/**
+ * A picture from the release notes, fetched once it comes within a screen of the viewport: an opened
+ * card lays out every picture at once, and a release can carry dozens of full-size screenshots. Until
+ * then the space is held at the picture's shape.
+ */
+@Composable
+private fun NotePicture(image: News.Block.Image, modifier: Modifier = Modifier) {
+    var near by remember(image.url) { mutableStateOf(false) }
+
+    Box(
+        modifier
+            .fillMaxWidth()
+            .aspectRatio(image.aspectRatio)
+            .clip(RoundedCornerShape(8.dp))
+            .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.4f))
+            .onGloballyPositioned { coordinates ->
+                if (!near) {
+                    val windowHeight = coordinates.findRootCoordinates().size.height
+                    near = coordinates.positionInWindow().y < windowHeight * 2f
+                }
+            },
+    ) {
+        if (near) {
+            AsyncImage(
+                model = image.url,
+                contentDescription = null,
+                modifier = Modifier.fillMaxSize(),
+                contentScale = ContentScale.Fit,
+            )
+        }
+    }
+}
+
 @Composable
 private fun ReleaseCard(item: News.Item, initiallyExpanded: Boolean) {
     // Keyed on the tag so it survives rotation.
     var expanded by rememberSaveable(item.tag) { mutableStateOf(initiallyExpanded) }
     val toggle = { expanded = !expanded }
 
-    GlassPanel(Modifier.fillMaxWidth()) {
+    // The pad's outline goes on the panel, in its shape, so it traces the card's edge
+    GlassPanel(
+        Modifier
+            .fillMaxWidth()
+            .controllerFocusable("news.${item.tag}", shape = RoundedCornerShape(28.dp), onConfirm = toggle),
+    ) {
         Column(
             Modifier
                 .fillMaxWidth()
-                // clickable AND controllerFocusable: the latter only wires the pad's confirm
-                // button into the nav registry, it does not make anything respond to a finger.
-                // Shipping only the focusable left "Show more" dead to touch, which is how every
-                // phone user meets this screen.
-                .clickable(onClick = toggle)
-                .controllerFocusable("news.${item.tag}", onConfirm = toggle),
+                // clickable as well as the pad stop above, which only wires the pad's confirm
+                // button into the nav registry and does not make anything respond to a finger
+                .clickable(onClick = toggle),
             verticalArrangement = Arrangement.spacedBy(6.dp),
         ) {
             Row(
@@ -215,14 +257,43 @@ private fun ReleaseCard(item: News.Item, initiallyExpanded: Boolean) {
                 ReleaseContributors(item.credited)
             }
 
-            if (item.notes.isBlank()) {
+            if (item.blocks.isEmpty()) {
                 Text(str("news.noNotes"), style = MaterialTheme.typography.bodySmall)
             } else {
-                Text(
-                    item.notes,
-                    style = MaterialTheme.typography.bodySmall,
-                    maxLines = if (expanded) Int.MAX_VALUE else 6,
-                )
+                if (expanded) {
+                    // A pad stop per paragraph and picture, so Down reads through a long release
+                    // instead of jumping past it
+                    var stop = 0
+                    // Closing from inside takes the paragraph's stop away; the selection goes to the
+                    // card rather than falling back to the top of the screen
+                    val collapse = {
+                        expanded = false
+                        SettingsControllerNav.selectById("news.${item.tag}")
+                        Unit
+                    }
+                    item.blocks.forEach { block ->
+                        when (block) {
+                            is News.Block.Text -> block.text.split("\n\n").forEach { paragraph ->
+                                Text(
+                                    paragraph,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    modifier = Modifier.controllerFocusable("news.${item.tag}.${stop++}", onConfirm = collapse, ring = false),
+                                )
+                            }
+                            is News.Block.Image -> NotePicture(
+                                block,
+                                Modifier.controllerFocusable("news.${item.tag}.${stop++}", onConfirm = collapse, ring = false),
+                            )
+                        }
+                    }
+                } else {
+                    // The preview stays text: pictures only load once the card is opened
+                    Text(
+                        item.notes,
+                        style = MaterialTheme.typography.bodySmall,
+                        maxLines = 6,
+                    )
+                }
                 Text(
                     str(if (expanded) "news.showLess" else "news.showMore"),
                     style = MaterialTheme.typography.labelSmall,
