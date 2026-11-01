@@ -404,14 +404,12 @@ val checkNoWindowModals by tasks.registering {
 tasks.named("preBuild") { dependsOn(checkNoWindowModals) }
 
 dependencies {
-    // Discord Social SDK, staged by hand rather than consumed as an .aar. The .aar's manifest
-    // declares RECORD_AUDIO plus four foreground-service permissions and Bluetooth, all for its
-    // voice features, and the manifest merger would fold every one of them into ARMSX2 -- the Play
-    // listing would then show "Microphone" and need a data-safety declaration for a feature we do
-    // not ship. Taking the pieces we want means we inherit no permissions at all: the native lib
-    // lives in jniLibs, the headers under cpp/3rdparty/discord, and AuthenticationActivity is
-    // declared in our own manifest. libwebrtc is here because the SDK's audio classes reference it
-    // and would otherwise NoClassDefFoundError if any init path touches them.
+    // Discord Social SDK. Its .aar's manifest declares RECORD_AUDIO plus foreground-service and
+    // audio-settings permissions for its voice features, and the manifest merger folds them into
+    // ARMSX2. RECORD_AUDIO is ours as well now (the emulated PS2 microphone reads the device's
+    // microphone through Oboe), so AndroidManifest.xml keeps it and "Microphone" on the Play listing
+    // is accurate. The others are removed there with tools:node="remove", since we ship none of
+    // those features.
     // The .aar, not its unpacked pieces: this is what delivers the SDK's manifest entries, its
     // consumer proguard rules and its transitive dependencies. Reconstructing those by hand cost
     // three separate bugs (boot crash, missing <queries>, missing androidx.browser).
