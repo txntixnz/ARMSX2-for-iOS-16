@@ -699,6 +699,53 @@ bool VMManager::Internal::CheckSettingsVersion()
 	return (bsi->GetUIntValue("UI", "SettingsVersion", &settings_version) && settings_version == SETTINGS_VERSION);
 }
 
+// A settings file marks itself with this key in [UI] once the lag default has been dealt with: SetDefaultSettings sets it
+// in a new file, and MigrateSettings sets it after moving an old one.
+static constexpr const char* IOP_THREAD_LAG_MIGRATED_KEY = "IopThreadLagMigrated";
+
+// What iopThreadLag defaulted to before it became one frame (IopThread::kDefaultSettingLag). A file made then holds this
+// exact value, so it is a stored default and not a choice. Kept as a number of its own: IopThread::kDefaultLag, which
+// has the same value, is the tight bound the lag rules use, and has to be free to move without moving this.
+static constexpr int IOP_THREAD_LAG_OLD_DEFAULT = 24576;
+
+// The same for the IOP thread default on a host with a narrow performance tier (IopThread::DefaultOnForHost).
+static constexpr const char* IOP_THREAD_NARROW_TIER_MIGRATED_KEY = "IopThreadNarrowTierMigrated";
+
+bool VMManager::Internal::MigrateSettings(SettingsInterface& bsi)
+{
+	// The host is read only when the move that needs it has not run yet.
+	const bool host_needed = !bsi.GetBoolValue("UI", IOP_THREAD_NARROW_TIER_MIGRATED_KEY, false);
+	return MigrateSettings(bsi, host_needed ? IopThread::CurrentHostInfo() : IopThread::HostCpuInfo{});
+}
+
+bool VMManager::Internal::MigrateSettings(SettingsInterface& bsi, const IopThread::HostCpuInfo& host)
+{
+	bool changed = false;
+
+	if (!bsi.GetBoolValue("UI", IOP_THREAD_LAG_MIGRATED_KEY, false))
+	{
+		bsi.SetBoolValue("UI", IOP_THREAD_LAG_MIGRATED_KEY, true);
+		changed = true;
+
+		int lag = 0;
+		if (bsi.GetIntValue("EmuCore/Speedhacks", "iopThreadLag", &lag) && lag == IOP_THREAD_LAG_OLD_DEFAULT)
+			bsi.SetIntValue("EmuCore/Speedhacks", "iopThreadLag", IopThread::kDefaultSettingLag);
+	}
+
+	if (!bsi.GetBoolValue("UI", IOP_THREAD_NARROW_TIER_MIGRATED_KEY, false))
+	{
+		bsi.SetBoolValue("UI", IOP_THREAD_NARROW_TIER_MIGRATED_KEY, true);
+		changed = true;
+
+		// The file's own MTVU setting counts one more thread in the host rule, as it will when the file is loaded.
+		const bool mtvu = bsi.GetBoolValue("EmuCore/Speedhacks", "vuThread", false);
+		if (IopThread::DefaultOnForHost(host, mtvu) && !bsi.GetBoolValue("EmuCore/Speedhacks", "iopThread", false))
+			bsi.SetBoolValue("EmuCore/Speedhacks", "iopThread", true);
+	}
+
+	return changed;
+}
+
 void VMManager::Internal::LoadStartupSettings()
 {
 	SettingsInterface* bsi = Host::Internal::GetBaseSettingsLayer();
@@ -735,6 +782,11 @@ void VMManager::SetDefaultSettings(
 		Pcsx2Config temp_config;
 		SettingsSaveWrapper ssw(si);
 		temp_config.LoadSave(ssw);
+
+		// The defaults just written are the current ones, so nothing in this file needs MigrateSettings. The
+		// host-dependent ones follow just below (SetHardwareDependentDefaultSettings).
+		si.SetBoolValue("UI", IOP_THREAD_LAG_MIGRATED_KEY, true);
+		si.SetBoolValue("UI", IOP_THREAD_NARROW_TIER_MIGRATED_KEY, true);
 
 		// Settings not part of the Pcsx2Config struct.
 		si.SetBoolValue("EmuCore", "EnableFastBoot", true);
@@ -4078,7 +4130,7 @@ void VMManager::CheckForMiscConfigChanges(const Pcsx2Config& old_config)
 	// threads to place, so the others' places can change with it.
 	if (HasValidVM() && (EmuConfig.EnableThreadPinning != old_config.EnableThreadPinning ||
 							EmuConfig.EnablePrimeCorePlacement != old_config.EnablePrimeCorePlacement ||
-							(s_thread_affinities_set && EmuConfig.Speedhacks.vuThread != old_config.Speedhacks.vuThread) ||
+							((s_thread_affinities_set || EmuConfig.EnableThreadPinning) && EmuConfig.Speedhacks.vuThread != old_config.Speedhacks.vuThread) ||
 							IopThread::PlacementToken() != s_iop_placement_token))
 	{
 		SetEmuThreadAffinities();
@@ -4887,7 +4939,8 @@ void VMManager::SetHardwareDependentDefaultSettings(SettingsInterface& si)
 
 	Console.WriteLn(fmt::format("CPU cores count: {}", core_count));
 
-	if (core_count >= 3)
+	const bool mtvu = (core_count >= 3);
+	if (mtvu)
 	{
 		Console.WriteLn("  Enabling MTVU.");
 		si.SetBoolValue("EmuCore/Speedhacks", "vuThread", true);
@@ -4897,6 +4950,14 @@ void VMManager::SetHardwareDependentDefaultSettings(SettingsInterface& si)
 		Console.WriteLn("  Disabling MTVU.");
 		si.SetBoolValue("EmuCore/Speedhacks", "vuThread", false);
 	}
+
+	// The IOP thread starts on where the performance tier is two or three cores (IopThread::DefaultOnForHost has the
+	// rule and the measurement behind it), and off everywhere else. The MTVU setting just chosen counts in it.
+	const IopThread::HostCpuInfo host = IopThread::CurrentHostInfo();
+	const bool iop_thread = IopThread::DefaultOnForHost(host, mtvu);
+	Console.WriteLn(fmt::format("  {} the IOP thread ({} performance cores of {}).", iop_thread ? "Enabling" : "Leaving off",
+		host.performance_cores, host.total_cores));
+	si.SetBoolValue("EmuCore/Speedhacks", "iopThread", iop_thread);
 
 	const int extra_threads = (core_count > 3) ? 3 : 2;
 	Console.WriteLn(fmt::format("  Setting Extra Software Rendering Threads to {}.", extra_threads));
@@ -4908,11 +4969,23 @@ void VMManager::SetHardwareDependentDefaultSettings(SettingsInterface& si)
 	// on Apple Silicon under Asahi and Intel Alder Lake-class hybrid systems.
 	// SetEmuThreadAffinities already sorts processors by frequency, so pinning
 	// to indices 0..2 lands on the fastest cores.
+	//
+	// Not where the performance tier cannot hold the EE, GS and (with MTVU) VU1 threads: the ordered pin gives out the
+	// fastest processors first, so with two fast cores it puts the GS thread on a slow one (IopThread::OrderedPinAllowed).
 	if (cpuinfo_get_clusters_count() > 1 && core_count >= 3)
 	{
-		Console.WriteLn(fmt::format("  Heterogeneous CPU detected ({} clusters); enabling thread pinning.",
-			cpuinfo_get_clusters_count()));
-		si.SetBoolValue("EmuCore", "EnableThreadPinning", true);
+		if (IopThread::OrderedPinAllowed(VMManager::Internal::GetPerformanceCoreMask(), mtvu))
+		{
+			Console.WriteLn(fmt::format("  Heterogeneous CPU detected ({} clusters); enabling thread pinning.",
+				cpuinfo_get_clusters_count()));
+			si.SetBoolValue("EmuCore", "EnableThreadPinning", true);
+		}
+		else
+		{
+			Console.WriteLn(fmt::format("  Heterogeneous CPU detected ({} clusters), but its {} performance cores cannot hold the EE, GS{} "
+										"threads; leaving thread pinning off.",
+				cpuinfo_get_clusters_count(), host.performance_cores, mtvu ? " and VU1" : ""));
+		}
 	}
 }
 
@@ -4971,6 +5044,7 @@ void VMManager::SetHardwareDependentDefaultSettings(SettingsInterface& si)
 u64 VMManager::Internal::GetPerformanceCoreMask()
 {
 #if defined(__linux__)
+	EnsureCPUInfoInitialized(); // callable before the VM exists: the settings defaults and migration ask it
 	return GetPerformanceCoresMask();
 #else
 	return 0; // no capacity source: the cores cannot be told apart, so Threaded is not offered
@@ -4986,12 +5060,15 @@ bool VMManager::Internal::CanSplitGS()
 {
 #if defined(__linux__)
 	EnsureCPUInfoInitialized();
-	// EE, VU1, GS front and GS back, plus the IOP thread when it is asked for: that one is busy 40 to 99% of a core, and a
-	// split beside it needs a fifth performance core: with the IOP thread on and only four big cores, the split
-	// measured slower than a single GS thread in most games tried, even with the prime core rule.
-	const u32 needed = 4 + (EmuConfig.Speedhacks.iopThread ? 1 : 0);
-	const u32 tier = GetPerformanceCoreCount();
-	return tier >= needed && tier < cpuinfo_get_processors_count();
+	// EE, VU1, GS front and GS back, plus the IOP thread when it will run on a thread of its own (IopThread::GsSplitFits
+	// says why it takes a fifth core). The setting being on is not enough: it can be on (a player turned it on, or
+	// the game database did) on a host ResolveMode can never give Threaded (not ARM64, fewer than two performance cores,
+	// too few cores in total), and there the thread never exists and must not cost the split a core. The VM conditions are left at their defaults: this is a
+	// question about the host. For an arcade title, or while an IOP breakpoint is set, the thread is Off for that VM
+	// and the split is withheld anyway, which errs on the side of the measured result.
+	const bool iop_thread_threaded =
+		IopThread::ResolveMode(EmuConfig, IopThread::CurrentHostInfo(), IopThread::VmConditions{}) == IopThreadMode::Threaded;
+	return IopThread::GsSplitFits(GetPerformanceCoreCount(), cpuinfo_get_processors_count(), iop_thread_threaded);
 #else
 	return false;
 #endif
@@ -5088,13 +5165,45 @@ bool VMManager::Internal::GSBackThreadWouldShareBusyCore()
 int g_android_affinity_mode = 7;
 #endif
 
+// Where an IOP thread that was not given a processor of its own goes (IopThread::UnpinnedIopThreadMask): outside
+// the performance tier when the tier is too narrow for every thread that wants it. 0 when it can float.
+static u64 GetIopThreadOutsideTierMask()
+{
+#if defined(__linux__)
+	VMManager::EnsureCPUInfoInitialized();
+	u64 all = 0;
+	const u32 count = cpuinfo_get_processors_count();
+	for (u32 i = 0; i < count; i++)
+	{
+		const cpuinfo_processor* proc = cpuinfo_get_processor(i);
+		if (proc && GetProcessorIdForProcessor(proc) < 64)
+			all |= static_cast<u64>(1) << GetProcessorIdForProcessor(proc);
+	}
+	return IopThread::UnpinnedIopThreadMask(GetPerformanceCoresMask(), all, EmuConfig.Speedhacks.vuThread, IopThread::PlacesThread());
+#else
+	return 0; // no capacity source here: the tier cannot be read
+#endif
+}
+
 // The IOP thread's place. The thread begins with the affinity of the thread that created it, which is the CPU
 // thread, and that may have been narrowed to one core, so a thread that exists is always given a mask explicitly
 // (0 meaning any processor) rather than left to inherit one. Without a thread there is nothing to place.
+//
+// "Any processor" is the wrong answer on a host whose performance tier is narrower than the threads that want it,
+// whichever affinity mode asked for it: the thread spins while it waits, and floating it puts it on the big cores
+// beside the EE, GS and VU1 threads. Those requests become "every processor outside the tier".
 static void SetIopThreadAffinity(u64 mask)
 {
-	if (IopThread::g_thread.IsRunning())
-		IopThread::g_thread.GetThreadHandle().SetAffinity(mask);
+	if (!IopThread::g_thread.IsRunning())
+		return;
+
+	if (mask == 0)
+	{
+		mask = GetIopThreadOutsideTierMask();
+		if (mask != 0)
+			INFO_LOG("IOP thread pinned outside the performance tier (mask 0x{:x})", mask);
+	}
+	IopThread::g_thread.GetThreadHandle().SetAffinity(mask);
 }
 
 // The prime core. On a part with one core clearly faster than the rest of its performance tier, the
@@ -5366,14 +5475,14 @@ void VMManager::SetEmuThreadAffinities()
 	// pinning off, and a VM boot with pinning off is exactly the call a toggle check would skip.
 	// Threads we never narrowed are left alone, so a mask inherited from taskset survives.
 	const bool vm_running = (GetState() != VMState::Shutdown);
-	const bool new_pin_enable = (vm_running && EmuConfig.EnableThreadPinning);
+	const bool pin_requested = (vm_running && EmuConfig.EnableThreadPinning);
 	const bool was_pinned = s_thread_affinities_set;
 	static bool s_gs_tier_confined = false;
 
 	// Track whether pinning is *currently effective*, not just EmuConfig.EnableThreadPinning
 	// (matches refresh-experimental — a shutdown call with pinning enabled must not leave this
 	// flag true while the affinity + SW-renderer proc list get cleared).
-	s_thread_affinities_set = new_pin_enable;
+	s_thread_affinities_set = pin_requested;
 
 	EnsureCPUInfoInitialized();
 
@@ -5384,6 +5493,22 @@ void VMManager::SetEmuThreadAffinities()
 	}
 
 	const bool mtvu = EmuConfig.Speedhacks.vuThread;
+
+	// The ordered pin hands out the fastest processors first: EE, VU1, GS. On a performance tier of two that puts the GS
+	// thread on a slow core, and measured on two fast cores it lost 30 to 45% speed whether or not the IOP thread ran.
+	// Where the tier can be read and cannot hold those threads, fall back to the unpinned placement below, as Android's
+	// Performance Cores mode does (IopThread::OrderedPinAllowed).
+	const u64 perf_mask = Internal::GetPerformanceCoreMask();
+	const bool tier_too_narrow = pin_requested && !IopThread::OrderedPinAllowed(perf_mask, mtvu);
+	if (tier_too_narrow)
+	{
+		INFO_LOG("Thread pinning is on, but the performance tier has {} core(s) and the EE, GS{} threads need {}: not pinning them in "
+				 "order, using the unpinned placement instead.",
+			std::popcount(perf_mask), mtvu ? " and VU1" : "", mtvu ? 3 : 2);
+	}
+	const bool new_pin_enable = pin_requested && !tier_too_narrow;
+	s_thread_affinities_set = new_pin_enable;
+
 	if (!new_pin_enable || s_processor_list.size() < (mtvu ? 3 : 2))
 	{
 		if (new_pin_enable)
@@ -5393,6 +5518,14 @@ void VMManager::SetEmuThreadAffinities()
 		{
 			vu1Thread.GetThreadHandle().SetAffinity(0);
 			s_vm_thread_handle.SetAffinity(0);
+			SetIopThreadAffinity(0);
+		}
+		else if (GetIopThreadOutsideTierMask() != 0)
+		{
+			// Unpinned, with a tier too narrow for every thread that wants it: the IOP thread would float over the fast
+			// cores beside the EE, GS and VU1 threads (SetIopThreadAffinity says why that is wrong), so it is placed
+			// outside the tier. A host whose tier fits them all, or one with no IOP thread, gets no mask here and is
+			// left as it was.
 			SetIopThreadAffinity(0);
 		}
 		s_software_renderer_processor_list = {};

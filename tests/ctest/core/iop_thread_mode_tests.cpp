@@ -9,6 +9,8 @@
 
 #include "Config.h"
 #include "GameDatabase.h"
+#include "IopThread/IopChannels.h"
+#include "IopThread/IopLagRules.h"
 #include "IopThread/IopThreadMode.h"
 #include "PerGameOverrides.h"
 
@@ -42,6 +44,8 @@ namespace
 	const HostCpuInfo kM2Max = Host(true, 12, 8); // 8 performance + 4 efficiency
 	const HostCpuInfo kRk3562 = Host(true, 4, 4); // 4 A53, all alike
 	const HostCpuInfo kSd662 = Host(true, 8, 4); // 4 A73 + 4 A53
+	const HostCpuInfo kRg55g1 = Host(true, 8, 2); // 2 A78 + 6 A55
+	const HostCpuInfo kUniform8 = Host(true, 8, 8); // 8 cores of one speed: every one is in the tier
 
 	Pcsx2Config Requested(bool iop_thread, bool lockstep, bool mtvu)
 	{
@@ -87,14 +91,36 @@ TEST(IopThreadMode, AnEmptySettingsFileLoadsAsOff)
 	const Pcsx2Config::SpeedhackOptions hacks = LoadHacks(si);
 	EXPECT_FALSE(hacks.iopThread);
 	EXPECT_FALSE(hacks.iopThreadLockstep);
-	EXPECT_EQ(hacks.iopThreadLag, IopThread::kDefaultLag);
+	EXPECT_EQ(hacks.iopThreadLag, IopThread::kDefaultSettingLag);
 }
 
-TEST(IopThreadMode, TheDefaultLagIsTwentyFourThousandFiveHundredSeventySixCycles)
+TEST(IopThreadMode, TheDefaultOfTheLagSettingIsOneFrame)
 {
-	// Eight times kEeWaitCycles, the longest the EE runs between event tests.
+	// One NTSC frame of EE cycles: 294,912,000 a second at 60 Hz.
+	EXPECT_EQ(IopThread::kOneFrameLag, 294912000 / 60);
+	EXPECT_EQ(IopThread::kDefaultSettingLag, 4915200);
+	EXPECT_EQ(Pcsx2Config().Speedhacks.iopThreadLag, 4915200);
+	EXPECT_EQ(Pcsx2Config::SpeedhackOptions().iopThreadLag, IopThread::kDefaultSettingLag);
+	// The default is a value the core keeps as it is.
+	EXPECT_EQ(IopThread::ClampLag(IopThread::kDefaultSettingLag), IopThread::kDefaultSettingLag);
+}
+
+TEST(IopThreadMode, TheTightBoundStaysTwentyFourThousandFiveHundredSeventySixCycles)
+{
+	// Eight times kEeWaitCycles, the longest the EE runs between event tests. It is no longer the default of the
+	// setting, but the lag rules fall back to it while the EE waits on the IOP, and a bound at or below it
+	// turns the rules off, so it must not move with the setting's default.
 	EXPECT_EQ(IopThread::kDefaultLag, 24576);
-	EXPECT_EQ(Pcsx2Config().Speedhacks.iopThreadLag, 24576);
+	EXPECT_EQ(IopThread::LagRulesConfig().tight, 24576);
+	EXPECT_LT(IopThread::kDefaultLag, IopThread::kDefaultSettingLag);
+}
+
+TEST(IopThreadMode, DisableAllPutsTheLagBackToTheDefaultOfTheSetting)
+{
+	Pcsx2Config::SpeedhackOptions hacks;
+	hacks.iopThreadLag = IopThread::kMinLag;
+	hacks.DisableAll();
+	EXPECT_EQ(hacks.iopThreadLag, IopThread::kDefaultSettingLag);
 }
 
 TEST(IopThreadMode, TheEnableFlagAloneGivesThreaded)
@@ -246,10 +272,79 @@ TEST(IopThreadModeDevices, TheSd662ClassIsOnButUntested)
 
 TEST(IopThreadModeDevices, TheCoreRuleCountsTheVuThread)
 {
-	// threads = EE + GS + IOP, plus one when MTVU is on.
-	const HostCpuInfo three_big = Host(true, 8, 3);
-	EXPECT_EQ(Resolve(true, false, false, three_big), IopThreadMode::Threaded); // needs 3 performance, 5 total
-	EXPECT_EQ(Resolve(true, false, true, three_big), IopThreadMode::Off); // needs 4 performance, 6 total
+	// threads = EE + GS + IOP, plus one when MTVU is on, and two cores more for the rest.
+	const HostCpuInfo five_cores = Host(true, 5, 3);
+	EXPECT_EQ(Resolve(true, false, false, five_cores), IopThreadMode::Threaded); // needs 5 cores in total
+	EXPECT_EQ(Resolve(true, false, true, five_cores), IopThreadMode::Off); // needs 6 in total
+	EXPECT_EQ(Resolve(true, false, true, Host(true, 6, 3)), IopThreadMode::Threaded);
+}
+
+TEST(IopThreadModeDevices, ATierNarrowerThanTheThreadsDoesNotSwitchItOff)
+{
+	// The RG 55G1: two big cores and six little ones. The IOP thread runs on the little ones (UnpinnedIopThreadMask),
+	// so the big cores are not needed for it, with MTVU on or off.
+	EXPECT_EQ(Resolve(true, false, true, kRg55g1), IopThreadMode::Threaded);
+	EXPECT_EQ(Resolve(true, false, false, kRg55g1), IopThreadMode::Threaded);
+	// A tier of three, MTVU on: four threads on three fast cores.
+	EXPECT_EQ(Resolve(true, false, true, Host(true, 8, 3)), IopThreadMode::Threaded);
+	// Two fast cores is the narrowest tier that is enough.
+	EXPECT_EQ(Resolve(true, false, true, Host(true, 8, 2)), IopThreadMode::Threaded);
+}
+
+TEST(IopThreadModeDevices, TheTierNeedsAtLeastTwoPerformanceCores)
+{
+	EXPECT_EQ(IopThread::kMinPerformanceCores, 2u);
+
+	// One fast core: the EE and GS threads cannot both have one. Off with MTVU on or off, on a host with cores to spare.
+	EXPECT_EQ(Resolve(true, false, true, Host(true, 8, 1)), IopThreadMode::Off);
+	EXPECT_EQ(Resolve(true, false, false, Host(true, 8, 1)), IopThreadMode::Off);
+	EXPECT_EQ(Resolve(true, false, true, Host(true, 16, 1)), IopThreadMode::Off);
+	// The same host with a second fast core resolves.
+	EXPECT_EQ(Resolve(true, false, true, Host(true, 8, 2)), IopThreadMode::Threaded);
+	EXPECT_EQ(Resolve(true, false, false, Host(true, 8, 2)), IopThreadMode::Threaded);
+	// Nothing to count is no tier either.
+	EXPECT_EQ(Resolve(true, false, false, Host(true, 8, 0)), IopThreadMode::Off);
+}
+
+TEST(IopThreadModeDevices, TheTwoCoreTierDoesNotWaiveTheTotalCoreRule)
+{
+	// Two fast cores and too few cores in total is still Off: the two rules are independent.
+	EXPECT_EQ(Resolve(true, false, false, Host(true, 4, 2)), IopThreadMode::Off); // 3 threads need 5 cores
+	EXPECT_EQ(Resolve(true, false, true, Host(true, 5, 2)), IopThreadMode::Off); // 4 threads need 6 cores
+	EXPECT_EQ(Resolve(true, false, true, Host(true, 6, 2)), IopThreadMode::Threaded);
+}
+
+TEST(IopThreadModeDevices, TheLockstepModeIgnoresTheTwoCoreTierToo)
+{
+	EXPECT_EQ(Resolve(true, true, true, Host(true, 8, 1)), IopThreadMode::Lockstep);
+	EXPECT_EQ(Resolve(true, true, true, Host(true, 2, 1)), IopThreadMode::Lockstep);
+}
+
+TEST(IopThreadModeDevices, AHostWhoseCoresAreAllAlikeIsJudgedByItsCoreCountAlone)
+{
+	// GetPerformanceCoresMask() puts every core of at least 0.75 of the fastest into the tier, so on a part with one
+	// core speed the tier is every core. It is only 0 when no core's speed can be read.
+	//
+	// RK3566 (4 x A55) and RK3562 (4 x A53): the tier holds four cores, but four cores leave nothing over once the
+	// threads have theirs (3 threads need 5 cores, 4 need 6).
+	EXPECT_EQ(Resolve(true, false, true, kRk3562), IopThreadMode::Off);
+	EXPECT_EQ(Resolve(true, false, false, kRk3562), IopThreadMode::Off);
+	// Five alike cores: enough without MTVU, not with it.
+	EXPECT_EQ(Resolve(true, false, false, Host(true, 5, 5)), IopThreadMode::Threaded);
+	EXPECT_EQ(Resolve(true, false, true, Host(true, 5, 5)), IopThreadMode::Off);
+	// Six and eight alike cores resolve, with MTVU on or off. The tier holds all four threads, so nothing is placed
+	// outside it.
+	EXPECT_EQ(Resolve(true, false, true, Host(true, 6, 6)), IopThreadMode::Threaded);
+	EXPECT_EQ(Resolve(true, false, true, kUniform8), IopThreadMode::Threaded);
+	EXPECT_EQ(Resolve(true, false, false, kUniform8), IopThreadMode::Threaded);
+}
+
+TEST(IopThreadModeDevices, ANarrowTierStillNeedsTheCoresForTheRest)
+{
+	// Two big and two little cores: the tier is fine to read, but four cores leave nothing for the OS, the GS back
+	// thread and the audio callback.
+	EXPECT_EQ(Resolve(true, false, false, Host(true, 4, 2)), IopThreadMode::Off);
+	EXPECT_EQ(Resolve(true, false, false, Host(true, 5, 2)), IopThreadMode::Threaded);
 }
 
 TEST(IopThreadModeDevices, TheCoreRuleNeedsTwoSpareCoresBeyondTheThreads)
@@ -260,9 +355,10 @@ TEST(IopThreadModeDevices, TheCoreRuleNeedsTwoSpareCoresBeyondTheThreads)
 	EXPECT_EQ(Resolve(true, false, false, Host(true, 5, 3)), IopThreadMode::Threaded);
 }
 
-TEST(IopThreadModeDevices, AHostThatCannotTellItsCoresApartIsOff)
+TEST(IopThreadModeDevices, AHostThatCannotReadItsCoreSpeedsIsOff)
 {
-	// GetPerformanceCoresMask() returns 0 when the cores look identical or cannot be read.
+	// GetPerformanceCoresMask() returns 0 when no core's speed can be read (and on a host with no capacity source, such
+	// as macOS or Windows). Cores that merely look alike are not this case: see the test above.
 	EXPECT_EQ(Resolve(true, false, true, Host(true, 8, 0)), IopThreadMode::Off);
 	EXPECT_EQ(Resolve(true, false, true, Host(true, 0, 0)), IopThreadMode::Off);
 }
@@ -277,7 +373,6 @@ TEST(IopThreadModeDevices, LockstepIgnoresTheCoreRuleOnEveryHost)
 	// The rows below are Off for Threaded and must not be for Lockstep.
 	EXPECT_EQ(Resolve(true, true, true, Host(true, 4, 4)), IopThreadMode::Lockstep); // RK3562 shape
 	EXPECT_EQ(Resolve(true, true, true, Host(true, 5, 4)), IopThreadMode::Lockstep); // one core short of 6
-	EXPECT_EQ(Resolve(true, true, true, Host(true, 8, 3)), IopThreadMode::Lockstep); // 3 big cores, MTVU on
 	EXPECT_EQ(Resolve(true, true, true, Host(true, 8, 0)), IopThreadMode::Lockstep); // cores not told apart
 	EXPECT_EQ(Resolve(true, true, true, Host(true, 1, 1)), IopThreadMode::Lockstep); // a single core
 	EXPECT_EQ(Resolve(true, true, true, Host(true, 0, 0)), IopThreadMode::Lockstep); // topology unreadable
@@ -289,7 +384,6 @@ TEST(IopThreadModeDevices, TheSameHostsAreOffForThreaded)
 	// for Threaded, so the difference between the two modes is the mode and nothing else.
 	EXPECT_EQ(Resolve(true, false, true, Host(true, 4, 4)), IopThreadMode::Off);
 	EXPECT_EQ(Resolve(true, false, true, Host(true, 5, 4)), IopThreadMode::Off);
-	EXPECT_EQ(Resolve(true, false, true, Host(true, 8, 3)), IopThreadMode::Off);
 	EXPECT_EQ(Resolve(true, false, true, Host(true, 8, 0)), IopThreadMode::Off);
 	EXPECT_EQ(Resolve(true, false, true, Host(true, 1, 1)), IopThreadMode::Off);
 	EXPECT_EQ(Resolve(true, false, true, Host(true, 0, 0)), IopThreadMode::Off);
@@ -357,16 +451,27 @@ TEST(IopThreadModeLag, TheMinimumLeavesRoomForTheOvershootOfBothThreads)
 	EXPECT_GE(IopThread::kMinLag - IopThread::kEeWaitCycles, 7 * (kEeOvershootP90 + kIopOvershootP90));
 }
 
-TEST(IopThreadModeLag, TheMaximumIsSmallEnoughForTheEeToIopQueueAndBelowAMillisecond)
+TEST(IopThreadModeLag, TheMaximumIsTwoFramesAndTheEeToIopQueueHoldsAWindowOfPosts)
 {
-	// About 527 posts per frame go into a 1024-entry queue, so a window of the maximum lag holds a
-	// few dozen posts at most.
+	// The maximum is two NTSC frames of EE cycles. A window of that length holds the blanking posts of
+	// the busiest title seen (1052 per frame on OutRun) plus a few dozen SIF items per frame, and the
+	// queue has to hold all of them with room to spare: the lag keeps the EE from running further ahead
+	// than the window, and a full queue stalls the EE.
 	constexpr double kEeCyclesPerFrame = 294912000.0 / 60.0;
-	constexpr double kPostsPerFrame = 527.0;
-	constexpr double kQueueEntries = 1024.0;
-	EXPECT_LT(IopThread::kMaxLag / kEeCyclesPerFrame * kPostsPerFrame, kQueueEntries / 10.0);
+	constexpr double kPostsPerFrame = 1052.0 + 64.0;
+	constexpr double kQueueEntries = static_cast<double>(IopThread::kE2IRingCapacity);
+	EXPECT_EQ(IopThread::kMaxLag, 3200 * IopThread::kEeWaitCycles);
+	EXPECT_DOUBLE_EQ(IopThread::kMaxLag / kEeCyclesPerFrame, 2.0);
+	EXPECT_LT(IopThread::kMaxLag / kEeCyclesPerFrame * kPostsPerFrame, kQueueEntries / 3.0);
 	// The largest delay before the EE sees an IOP effect is the lag plus one event-test spacing.
-	EXPECT_LT((IopThread::kMaxLag + IopThread::kEeWaitCycles) / 294912000.0, 0.001);
+	EXPECT_LT((IopThread::kMaxLag + IopThread::kEeWaitCycles) / 294912000.0, 0.034);
+}
+
+TEST(IopThreadModeLag, TheMaximumLeavesS32Headroom)
+{
+	// The lag is an s32 and is added to cycle differences (EEsCycle is an s32 too).
+	EXPECT_EQ(IopThread::kMaxLag % IopThread::kEeWaitCycles, 0);
+	EXPECT_LT(static_cast<s64>(IopThread::kMaxLag) * 64, static_cast<s64>(INT32_MAX));
 }
 
 TEST(IopThreadModeLag, ValuesAtOrBelowTheEventTestSpacingAreRaisedToTheMinimum)
@@ -397,7 +502,10 @@ TEST(IopThreadModeLag, ValuesInRangeAreKept)
 	EXPECT_EQ(ClampLag(IopThread::kMinLag), IopThread::kMinLag);
 	EXPECT_EQ(ClampLag(IopThread::kMinLag + 1), IopThread::kMinLag + 1);
 	EXPECT_EQ(ClampLag(IopThread::kDefaultLag), 24576);
+	EXPECT_EQ(ClampLag(IopThread::kDefaultSettingLag), 4915200);
 	EXPECT_EQ(ClampLag(12288), 12288);
+	EXPECT_EQ(ClampLag(196608), 196608); // the old maximum is an ordinary value now
+	EXPECT_EQ(ClampLag(4900000), 4900000); // about one frame
 	EXPECT_EQ(ClampLag(IopThread::kMaxLag - 1), IopThread::kMaxLag - 1);
 	EXPECT_EQ(ClampLag(IopThread::kMaxLag), IopThread::kMaxLag);
 }
@@ -405,7 +513,8 @@ TEST(IopThreadModeLag, ValuesInRangeAreKept)
 TEST(IopThreadModeLag, ValuesAboveTheMaximumAreLowered)
 {
 	EXPECT_EQ(ClampLag(IopThread::kMaxLag + 1), IopThread::kMaxLag);
-	EXPECT_EQ(ClampLag(1000000), IopThread::kMaxLag);
+	EXPECT_EQ(ClampLag(IopThread::kMaxLag * 2), IopThread::kMaxLag);
+	EXPECT_EQ(ClampLag(20000000), IopThread::kMaxLag);
 	EXPECT_EQ(ClampLag(INT_MAX), IopThread::kMaxLag);
 }
 
@@ -416,6 +525,7 @@ TEST(IopThreadModeLag, TheSettingsFileIsClampedWhenItIsRead)
 	EXPECT_EQ(LoadLag(3072), IopThread::kMinLag);
 	EXPECT_EQ(LoadLag(0), IopThread::kMinLag);
 	EXPECT_EQ(LoadLag(-5), IopThread::kMinLag);
+	EXPECT_EQ(LoadLag(196608), 196608);
 	EXPECT_EQ(LoadLag(INT_MAX), IopThread::kMaxLag);
 }
 
@@ -423,7 +533,13 @@ TEST(IopThreadModeLag, ALagTheFileDoesNotNameIsTheDefault)
 {
 	MemorySettingsInterface si;
 	si.SetBoolValue("EmuCore/Speedhacks", "iopThread", true);
-	EXPECT_EQ(LoadHacks(si).iopThreadLag, 24576);
+	EXPECT_EQ(LoadHacks(si).iopThreadLag, IopThread::kDefaultSettingLag);
+}
+
+TEST(IopThreadModeLag, ALagTheFileNamesStaysWhateverTheDefaultIs)
+{
+	// A settings file written while 24576 was the default has that value in it, and loads as 24576.
+	EXPECT_EQ(LoadLag(24576), 24576);
 }
 
 TEST(IopThreadSetting, TheKeysLiveInTheSpeedhacksSectionAndRoundTrip)
@@ -431,6 +547,7 @@ TEST(IopThreadSetting, TheKeysLiveInTheSpeedhacksSectionAndRoundTrip)
 	Pcsx2Config::SpeedhackOptions hacks;
 	hacks.iopThread = true;
 	hacks.iopThreadLockstep = true;
+	hacks.iopThreadDeferSif = true;
 	hacks.iopThreadLag = 9000;
 
 	MemorySettingsInterface si;
@@ -439,18 +556,21 @@ TEST(IopThreadSetting, TheKeysLiveInTheSpeedhacksSectionAndRoundTrip)
 		hacks.LoadSave(wrap);
 	}
 
-	bool enabled = false, lockstep = false;
+	bool enabled = false, lockstep = false, defer_sif = false;
 	s32 lag = 0;
 	ASSERT_TRUE(si.GetBoolValue("EmuCore/Speedhacks", "iopThread", &enabled));
 	ASSERT_TRUE(si.GetBoolValue("EmuCore/Speedhacks", "iopThreadLockstep", &lockstep));
+	ASSERT_TRUE(si.GetBoolValue("EmuCore/Speedhacks", "iopThreadDeferSif", &defer_sif));
 	ASSERT_TRUE(si.GetIntValue("EmuCore/Speedhacks", "iopThreadLag", &lag));
 	EXPECT_TRUE(enabled);
 	EXPECT_TRUE(lockstep);
+	EXPECT_TRUE(defer_sif);
 	EXPECT_EQ(lag, 9000);
 
 	const Pcsx2Config::SpeedhackOptions loaded = LoadHacks(si);
 	EXPECT_TRUE(loaded.iopThread);
 	EXPECT_TRUE(loaded.iopThreadLockstep);
+	EXPECT_TRUE(loaded.iopThreadDeferSif);
 	EXPECT_EQ(loaded.iopThreadLag, 9000);
 }
 
@@ -459,9 +579,11 @@ TEST(IopThreadSetting, TheKeysAreReadFromTheFile)
 	MemorySettingsInterface si;
 	si.SetBoolValue("EmuCore/Speedhacks", "iopThread", true);
 	si.SetBoolValue("EmuCore/Speedhacks", "iopThreadLockstep", true);
+	si.SetBoolValue("EmuCore/Speedhacks", "iopThreadDeferSif", true);
 	const Pcsx2Config::SpeedhackOptions hacks = LoadHacks(si);
 	EXPECT_TRUE(hacks.iopThread);
 	EXPECT_TRUE(hacks.iopThreadLockstep);
+	EXPECT_TRUE(hacks.iopThreadDeferSif);
 }
 
 TEST(IopThreadSetting, ASetFlagThatTheFileLeavesOutStaysSetLikeTheOtherSpeedhacks)
@@ -488,6 +610,10 @@ TEST(IopThreadSetting, EachKeyTakesPartInEquality)
 	b.iopThreadLockstep = true;
 	EXPECT_TRUE(b != base);
 
+	Pcsx2Config::SpeedhackOptions d = base;
+	d.iopThreadDeferSif = true;
+	EXPECT_TRUE(d != base);
+
 	Pcsx2Config::SpeedhackOptions c = base;
 	c.iopThreadLag = base.iopThreadLag + 1;
 	EXPECT_TRUE(c != base);
@@ -500,9 +626,11 @@ TEST(IopThreadSetting, DisableAllTurnsTheFeatureOff)
 	Pcsx2Config::SpeedhackOptions hacks;
 	hacks.iopThread = true;
 	hacks.iopThreadLockstep = true;
+	hacks.iopThreadDeferSif = true;
 	hacks.DisableAll();
 	EXPECT_FALSE(hacks.iopThread);
 	EXPECT_FALSE(hacks.iopThreadLockstep);
+	EXPECT_FALSE(hacks.iopThreadDeferSif);
 }
 
 TEST(IopThreadSetting, NoOtherSpeedhackBitMoved)
@@ -525,6 +653,15 @@ TEST(IopThreadSetting, NoOtherSpeedhackBitMoved)
 	EXPECT_EQ(only([](auto& h) { h.vu1Instant = true; }), 1u << 5);
 	EXPECT_EQ(only([](auto& h) { h.iopThread = true; }), 1u << 6);
 	EXPECT_EQ(only([](auto& h) { h.iopThreadLockstep = true; }), 1u << 7);
+	EXPECT_EQ(only([](auto& h) { h.DynamicEECycleRate = true; }), 1u << 8);
+	EXPECT_EQ(only([](auto& h) { h.iopThreadDeferSif = true; }), 1u << 9);
+}
+
+TEST(IopThreadSetting, TheSifDeferralIsOffByDefaultAndHasNoGameDatabaseName)
+{
+	EXPECT_FALSE(Pcsx2Config::SpeedhackOptions().iopThreadDeferSif);
+	// INI only: not one of the SpeedHack ids a game entry or a per-game override can carry.
+	EXPECT_FALSE(Pcsx2Config::SpeedhackOptions::ParseSpeedHackName("iopThreadDeferSif").has_value());
 }
 
 TEST(IopThreadGameDB, TheHackHasAnIniNameAndAGameDatabaseName)
@@ -542,7 +679,7 @@ TEST(IopThreadGameDB, SetWritesTheEnableFlagOnly)
 	hacks.Set(SpeedHack::IOPThread, 1);
 	EXPECT_TRUE(hacks.iopThread);
 	EXPECT_FALSE(hacks.iopThreadLockstep);
-	EXPECT_EQ(hacks.iopThreadLag, IopThread::kDefaultLag);
+	EXPECT_EQ(hacks.iopThreadLag, IopThread::kDefaultSettingLag);
 	hacks.Set(SpeedHack::IOPThread, 0);
 	EXPECT_FALSE(hacks.iopThread);
 }

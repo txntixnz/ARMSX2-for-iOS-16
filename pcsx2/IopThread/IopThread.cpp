@@ -107,6 +107,7 @@ namespace IopThread
 		m_mode = m_params.mode;
 		m_lag = m_params.lag;
 		m_min_slice = std::max<s32>(m_params.min_slice, 0);
+		m_lockstep_skew = (m_mode == IopThreadMode::Lockstep) ? std::clamp<s64>(m_params.lockstep_skew, 0, kMaxLag) : 0;
 		m_idle_spin_ns = m_params.idle_spin_ns;
 #if defined(__linux__)
 		m_use_membarrier = (m_params.sleep_barrier == SleepBarrier::Auto) && RegisterMembarrier();
@@ -117,7 +118,19 @@ namespace IopThread
 
 		// Nothing else touches any of this: the IOP thread does not exist yet. The thread's creation
 		// orders these writes before its first read.
+		m_replies.Reset();
+		m_rules.Configure(m_params.rules);
+		m_rules.Reset(m_params.start_frame);
+		m_streams.store(0, std::memory_order_relaxed);
+		m_ev_idle = false;
+		m_ev_frame = 0;
+		m_lockstep_skew_cur = m_lockstep_skew;
 		m_e2i.Reset();
+		m_e2i_spill.clear();
+		m_e2i_spill_total = 0;
+		m_e2i_spill_max = 0;
+		m_catchups = 0;
+		m_catchup_cycles = 0;
 		m_i2e.Reset();
 		m_e2i_kicks.TakeAll();
 		m_call.fn = nullptr;
@@ -150,7 +163,8 @@ namespace IopThread
 				 &m_e2i_full_spins, &m_e2i_full_iterations, &m_e2i_full_failfast, &m_i2e_drained, &m_calls_served, &m_wakes_sent,
 				 &m_wakes_dropped, &m_stop_checks, &m_handoffs, &m_slices, &m_items_applied, &m_parks, &m_holds_entered,
 				 &m_calls_posted, &m_calls_cancelled, &m_i2e_full_waits, &m_kicks_applied, &m_lag_spins_idle, &m_lag_idle_stall_ns,
-				 &m_idle_waits, &m_idle_ns})
+				 &m_idle_waits, &m_idle_ns, &m_sif_deferred, &m_near_waits, &m_near_wait_iterations, &m_near_wait_ns, &m_sif_deferred_applied,
+				 &m_ee_event_tests, &m_ee_ff_wait_loop, &m_ee_ff_timeout_loop, &m_ee_ff_interpreter})
 			c->Reset();
 
 		// A hold that is live when the thread starts keeps it stopped: the IOP comes up held at the
@@ -205,6 +219,8 @@ namespace IopThread
 		m_running = false;
 		m_iop_tid = std::thread::id();
 		m_mode = IopThreadMode::Off;
+		m_lockstep_skew = 0;
+		m_lockstep_skew_cur = 0;
 	}
 
 	void Thread::ThreadMain()
@@ -329,7 +345,7 @@ namespace IopThread
 	void Thread::ApplyDueItems()
 	{
 		E2IItem item;
-		while (m_e2i.TryPopDue(m_iop_pos, item))
+		while (PopDueE2I(m_iop_pos, item))
 		{
 			if (m_params.apply_item)
 				m_params.apply_item(item);
@@ -359,9 +375,20 @@ namespace IopThread
 			reached = m_iop_pos;
 		m_iop_pos = reached;
 		ApplyDueItems();
+		SampleStreams();
 		// Pairs with the acquire load in CheckLag, the hold handshake and PublishedPos().
 		m_iop.pos_pub.store(m_iop_pos, std::memory_order_release);
 		m_slices.Add();
+	}
+
+	// IOP thread, at the end of a slice: what the IOP's devices are doing, for LagRule::Stream. Written only when it changes.
+	void Thread::SampleStreams()
+	{
+		if (!m_params.sample_streams)
+			return;
+		const u32 now = m_params.sample_streams();
+		if (now != m_streams.load(std::memory_order_relaxed))
+			m_streams.store(now, std::memory_order_relaxed);
 	}
 
 	void Thread::ThreadedLoop()
@@ -446,22 +473,24 @@ namespace IopThread
 
 	bool Thread::PostI2E(u16 kind, u32 arg)
 	{
-		if (m_i2e.TryPush(kind, arg)) [[likely]]
+		// The time of production is the IOP's now, not the time the item gets into the queue, which is later when the queue is full.
+		const u32 stamp = static_cast<u32>(IopNow());
+		if (m_i2e.TryPush(kind, arg, stamp)) [[likely]]
 			return true;
-		return WaitForI2ESpace(kind, arg);
+		return WaitForI2ESpace(kind, arg, stamp);
 	}
 
 	// The IOP waits for the EE here, which the deadlock argument in IopThread.h allows. The EE empties
 	// the queue at every event test and in every spin, so this is short. It polls rather than parks so
 	// that the EE's drain has nothing to notify.
-	bool Thread::WaitForI2ESpace(u16 kind, u32 arg)
+	bool Thread::WaitForI2ESpace(u16 kind, u32 arg, u32 stamp)
 	{
 		m_i2e_full_waits.Add();
 		for (u32 n = 0;; n++)
 		{
 			if (m_ee.shutdown.load(std::memory_order_acquire))
 				return false;
-			if (m_i2e.TryPush(kind, arg))
+			if (m_i2e.TryPush(kind, arg, stamp))
 				return true;
 			if (n < kI2ESpaceSpins)
 				SpinHint();
@@ -482,6 +511,7 @@ namespace IopThread
 
 		m_call.fn = fn;
 		m_call.arg = arg;
+		m_call.stamp = static_cast<u32>(IopNow());
 		// Pairs with the acquire CAS in ServeCall().
 		m_call.state.store(kCallPosted, std::memory_order_release);
 		m_calls_posted.Add();
@@ -572,9 +602,19 @@ namespace IopThread
 			m_i2e.Pop();
 			taken++;
 			if (item.kind == I2EKind::CallOnEE)
+			{
 				ServeCall();
-			else if (m_params.handle_i2e)
-				m_params.handle_i2e(item);
+			}
+			else
+			{
+				if (item.kind == I2EKind::SbusIrq)
+				{
+					NoteReply(ReplyKind::SbusIrq, item.stamp);
+					m_rules.OnIopReply(m_params.ee_cycle ? m_params.ee_cycle() : m_ee_wm_local);
+				}
+				if (m_params.handle_i2e)
+					m_params.handle_i2e(item);
+			}
 		}
 		m_i2e_drained.Add(taken);
 		return taken;
@@ -591,6 +631,7 @@ namespace IopThread
 
 		void (*fn)(void*) = m_call.fn;
 		void* arg = m_call.arg;
+		NoteReply(ReplyKind::Call, m_call.stamp);
 		const bool was_in_call = m_in_call;
 		m_in_call = true;
 		fn(arg);
@@ -603,13 +644,15 @@ namespace IopThread
 		m_sema.NotifyOfWork(); // not filtered: the IOP may be asleep waiting for exactly this
 	}
 
-	bool Thread::LagSpin(u64 cycle)
+	bool Thread::LagSpin(u64 cycle, s64 bound, bool near_bound)
 	{
 		// A held or stopped IOP cannot catch up, and a CallOnEE function runs with the IOP blocked.
 		if (m_mode != IopThreadMode::Threaded || !m_running || m_hold_depth > 0 || m_in_call)
 			return true;
 
-		m_lag_spins.Add();
+		// The near bound's waits are not the lag bound's: they have counters of their own.
+		if (!near_bound)
+			m_lag_spins.Add();
 		// What the IOP was doing when the wait began, read before the wake-up below: asleep (or on its
 		// way), so the EE also waits for it to wake, or idle and awake, watching a watermark that gives it
 		// less than S_min to run.
@@ -628,7 +671,7 @@ namespace IopThread
 			if (m_i2e.MayHaveItems())
 				DrainI2E();
 			const u64 pos = m_iop.pos_pub.load(std::memory_order_acquire);
-			if (static_cast<s64>(cycle - pos) <= m_lag)
+			if (static_cast<s64>(cycle - pos) <= bound)
 			{
 				m_last_seen_iop_pos = pos;
 				reached = true;
@@ -642,8 +685,15 @@ namespace IopThread
 			}
 		}
 		m_ee.spinning.store(false, std::memory_order_relaxed);
-		m_lag_spin_iterations.Add(iterations);
 		const u64 stall_ns = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - begin).count());
+		if (near_bound)
+		{
+			m_near_waits.Add();
+			m_near_wait_iterations.Add(iterations);
+			m_near_wait_ns.Add(stall_ns);
+			return reached;
+		}
+		m_lag_spin_iterations.Add(iterations);
 		m_lag_stall_ns.Add(stall_ns);
 		if (found_parked)
 		{
@@ -658,8 +708,39 @@ namespace IopThread
 		return reached;
 	}
 
+	bool Thread::PopDueE2I(u64 now, E2IItem& out)
+	{
+		if (m_e2i.TryPopDue(now, out))
+			return true;
+		// The ring is older than the spill, so the spill is looked at only once the ring has nothing due (and nothing at all
+		// behind a head that is not due).
+		if (m_e2i_spill.empty() || m_e2i.NextStamp() != StampedRing<kE2IRingCapacity>::kNoStamp || m_e2i_spill.front().stamp > now)
+			return false;
+		out = m_e2i_spill.front();
+		m_e2i_spill.pop_front();
+		return true;
+	}
+
+	u64 Thread::NextE2IStamp()
+	{
+		const u64 ring = m_e2i.NextStamp();
+		if (ring != StampedRing<kE2IRingCapacity>::kNoStamp || m_e2i_spill.empty())
+			return ring;
+		return m_e2i_spill.front().stamp;
+	}
+
 	bool Thread::PostE2I(u64 stamp, u16 kind, u32 arg)
 	{
+		if (m_mode == IopThreadMode::Lockstep && m_lockstep_skew > 0) [[unlikely]]
+		{
+			// Never fails and never waits: see m_e2i_spill.
+			if (m_e2i_spill.empty() && m_e2i.TryPush(stamp, kind, arg))
+				return true;
+			m_e2i_spill.push_back(E2IItem{stamp, kind, 0, arg});
+			m_e2i_spill_total++;
+			m_e2i_spill_max = std::max<u64>(m_e2i_spill_max, m_e2i_spill.size());
+			return true;
+		}
 		if (!m_e2i.TryPush(stamp, kind, arg))
 		{
 			if (!WaitForE2ISpace(stamp, kind, arg))
@@ -823,6 +904,7 @@ namespace IopThread
 	{
 		pxAssertMsg(m_hold_depth > 0 || !m_running, "Resync() needs the IOP held or stopped");
 		m_e2i.Reset();
+		m_e2i_spill.clear();
 		m_i2e.Reset();
 		m_e2i_kicks.TakeAll();
 		m_ee_wm_local = ee_cycle;
@@ -871,6 +953,16 @@ namespace IopThread
 		return static_cast<size_t>(LockstepCall(kLsApplyUpTo, stamp));
 	}
 
+	u64 Thread::LockstepCatchUp(u64 ee_cycle)
+	{
+		const u64 before = m_iop_pos;
+		const u64 reached = LockstepCall(kLsCatchUp, ee_cycle);
+		m_catchups++;
+		if (reached > before)
+			m_catchup_cycles += reached - before;
+		return reached;
+	}
+
 	void Thread::LockstepLoop()
 	{
 		u64 done = 0;
@@ -886,11 +978,25 @@ namespace IopThread
 				if (m_host.HasPending())
 					m_host.RunPending();
 
-				if (m_ls.kind == kLsRunSlice)
+				if (m_ls.kind == kLsCatchUp)
 				{
-					const u64 reached = m_params.run_slice(m_iop_pos, m_ls.arg);
-					pxAssertMsg(reached >= m_iop_pos, "run_slice moved the IOP backwards");
-					m_iop_pos = std::max(reached, m_iop_pos);
+					LockstepSkewedSlice(m_ls.arg, 0);
+					m_iop.pos_pub.store(m_iop_pos, std::memory_order_relaxed);
+					m_ls.result = m_iop_pos;
+				}
+				else if (m_ls.kind == kLsRunSlice)
+				{
+					if (m_lockstep_skew > 0)
+					{
+						LockstepSkewedSlice(m_ls.arg, m_lockstep_skew_cur);
+					}
+					else
+					{
+						const u64 reached = m_params.run_slice(m_iop_pos, m_ls.arg);
+						pxAssertMsg(reached >= m_iop_pos, "run_slice moved the IOP backwards");
+						m_iop_pos = std::max(reached, m_iop_pos);
+					}
+					SampleStreams();
 					m_iop.pos_pub.store(m_iop_pos, std::memory_order_relaxed);
 					m_ls.result = m_iop_pos;
 				}
@@ -924,6 +1030,44 @@ namespace IopThread
 				return m_ee.req_seq.load(std::memory_order_seq_cst) != done || m_ee.shutdown.load(std::memory_order_seq_cst);
 			});
 		}
+	}
+
+	// The Lockstep handoff with a skew. The IOP runs towards `ee_cycle - skew`, one slice per item, as the Threaded loop
+	// does: it applies the items that are due, runs to the next item's stamp or to the goal, whichever comes first, and
+	// repeats. So an item takes effect when the IOP's own clock reaches its stamp, and the IOP ends the handoff
+	// at the goal, D behind the EE, plus the overshoot of its last block (which the next handoff takes into account:
+	// it runs from where the IOP really is). Until the EE has run `skew` cycles from where the IOP started there is no
+	// budget, and the IOP does not run.
+	//
+	// The one extra slice with no budget is the pending-event case of the pacing loop (has_event): the IOP has work of
+	// its own (an interrupt) even though the clock has nothing to give it, once per handoff, as in Off.
+	u64 Thread::LockstepSkewedSlice(u64 ee_cycle, s64 skew)
+	{
+		const s64 goal = static_cast<s64>(ee_cycle) - skew;
+		bool event_slice_run = false;
+		for (;;)
+		{
+			ApplyDueItems();
+
+			s64 stop = goal;
+			const u64 next = NextE2IStamp();
+			if (next != StampedRing<kE2IRingCapacity>::kNoStamp && static_cast<s64>(next) < stop)
+				stop = static_cast<s64>(next);
+
+			if (stop - static_cast<s64>(m_iop_pos) <= 0)
+			{
+				if (event_slice_run || !m_params.has_event || !m_params.has_event())
+					break;
+				event_slice_run = true;
+			}
+
+			const u64 reached = m_params.run_slice(m_iop_pos, static_cast<u64>(stop));
+			pxAssertMsg(reached >= m_iop_pos, "run_slice moved the IOP backwards");
+			m_iop_pos = std::max(reached, m_iop_pos);
+			m_slices.Add();
+		}
+		SampleStreams();
+		return m_iop_pos;
 	}
 
 	Thread::Ticket Thread::PostHostCommand(HostCommandQueue::Command command)
@@ -960,6 +1104,11 @@ namespace IopThread
 		s.emu_hold_requests = m_emu_hold_requests.Get();
 		s.emu_hold_stall_ns = m_emu_hold_stall_ns.Get();
 		s.sif_ee_pumps = m_sif_ee_pumps.Get();
+		s.sif_deferred = m_sif_deferred.Get();
+		s.near_waits = m_near_waits.Get();
+		s.near_wait_iterations = m_near_wait_iterations.Get();
+		s.near_wait_ns = m_near_wait_ns.Get();
+		s.sif_deferred_applied = m_sif_deferred_applied.Get();
 		s.hold_requests = m_hold_requests.Get();
 		s.hold_markers = m_hold_markers.Get();
 		s.hold_spin_iterations = m_hold_spin_iterations.Get();
@@ -973,6 +1122,20 @@ namespace IopThread
 		s.wakes_dropped = m_wakes_dropped.Get();
 		s.stop_checks = m_stop_checks.Get();
 		s.handoffs = m_handoffs.Get();
+		s.ee_event_tests = m_ee_event_tests.Get();
+		s.ee_ff_wait_loop = m_ee_ff_wait_loop.Get();
+		s.ee_ff_timeout_loop = m_ee_ff_timeout_loop.Get();
+		s.ee_ff_interpreter = m_ee_ff_interpreter.Get();
+		const ReplyStats& r = m_replies.Stats();
+		s.replies = r.replies;
+		s.late_replies = r.late;
+		s.idle_overshoots = r.idle_overshoots;
+		s.idle_overshoot_cycles = r.idle_overshoot_cycles;
+		s.idle_overshoot_max = r.idle_overshoot_max;
+		s.late_ee_busy = r.late_ee_busy;
+		s.late_idle_light = r.late_idle_light;
+		s.idle_overshoots_unbroken = r.idle_overshoots_unbroken;
+		s.idle_overshoots_90 = r.idle_overshoots_90;
 		s.slices = m_slices.Get();
 		s.items_applied = m_items_applied.Get();
 		s.parks = m_parks.Get();

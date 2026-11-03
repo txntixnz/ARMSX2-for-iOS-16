@@ -55,7 +55,9 @@ extern void gteGPF();   extern void gteGPL();   extern void gteNCCT();
 		armAsm->Mov(RWSCRATCH, (u32)psxRegs.code); \
 		armAsm->Str(RWSCRATCH, armPsxRegMem(&psxRegs.code)); \
 		_psxFlushCall(FLUSH_EVERYTHING); \
+		psxEmitSpill(); \
 		armEmitCall((void*)(uptr)psx##f); \
+		psxEmitReload(); \
 		PSX_DEL_CONST(_Rt_); \
 	}
 
@@ -65,7 +67,9 @@ extern void gteGPF();   extern void gteGPL();   extern void gteNCCT();
 		armAsm->Mov(RWSCRATCH, (u32)psxRegs.code); \
 		armAsm->Str(RWSCRATCH, armPsxRegMem(&psxRegs.code)); \
 		_psxFlushCall(FLUSH_EVERYTHING); \
+		psxEmitSpill(); \
 		armEmitCall((void*)(uptr)gte##f); \
+		psxEmitReload(); \
 	}
 
 ////////////////////////////////////////////////////////////////////
@@ -615,78 +619,53 @@ static void rpsxMTLO()
 ////////////////////////////////////////////////////////////////////
 // Load/Store
 //
-// Loads:  compute address in w0, flush, call iopMemReadN, sign/zero extend, store result
+// Loads:  RAM fast path inline, no flush; any other address calls iopMemReadN out of line
 // Stores: compute address in w0, value in w1, flush, call iopMemWriteN
 
 static void rpsxLoadGeneric(int size, bool sign)
 {
-	// Read Rs const value FIRST — before deleting Rt (critical when Rs==Rt,
-	// since _psxDeleteReg clears const state and frees the host register).
+	const IopLoadKind kind = size == 8 ? (sign ? IopLoadKind::LB : IopLoadKind::LBU)
+	                       : size == 16 ? (sign ? IopLoadKind::LH : IopLoadKind::LHU)
+	                                    : IopLoadKind::LW;
+
+	// Read Rs const value FIRST -- before the destination is allocated, which
+	// clears its const state (Rs==Rt).
 	const bool rs_const = PSX_IS_CONST1(_Rs_);
 	const u32 rs_val = rs_const ? g_psxConstRegs[_Rs_] : 0;
 
-	// Delete destination register (flush=1 to write back, in case Rs==Rt
-	// and Rs is in a host register — need the value in memory).
-	if (_Rt_)
-		_psxDeleteReg(_Rt_, 1);
+	// Nothing is flushed: the allocator keeps every guest register where it is
+	// across the load (see the inline fast path in iR3000A-arm64.cpp), so mark
+	// the operands needed before allocating the destination can evict one.
+	_addNeededPSXtoArm64GPR(_Rs_);
+	_addNeededPSXtoArm64GPR(_Rt_);
 
-	_psxFlushCall(FLUSH_EVERYTHING);
+	const int rs = rs_const ? -1 : _allocArm64GPR(ARM64TYPE_PSX, _Rs_, MODE_READ);
 
-	// Compute address: base + imm16 (after flush, safe to use w0)
+	// A load into $zero is a dummy read: it still happens, for what the device
+	// does when read, into a scratch register nothing looks at.
+	const a64::Register dst = _Rt_ ? armWRegister(_allocArm64GPR(ARM64TYPE_PSX, _Rt_, MODE_WRITE)) : a64::w10;
+
 	if (rs_const)
-	{
-		armAsm->Mov(RWARG1, rs_val + _Imm_);
-	}
+		psxEmitConstLoad(kind, dst, rs_val + _Imm_);
 	else
-	{
-		armLoadPsxRegPtr(RWARG1, &psxRegs.GPR.r[_Rs_]);
-		if (_Imm_ != 0)
-			armAsm->Add(RWARG1, RWARG1, static_cast<s64>(static_cast<s32>(_Imm_)));
-	}
+		psxEmitRamLoad(kind, dst, armWRegister(rs), static_cast<s32>(_Imm_));
 
-	// Call iopMemRead — address in w0, result returned in w0
-	switch (size)
-	{
-		case 8:  armEmitCall((void*)iopMemRead8);  break;
-		case 16: armEmitCall((void*)iopMemRead16); break;
-		case 32: armEmitCall((void*)iopMemRead32); break;
-	}
-
-	if (!_Rt_)
-		return; // dummy read
-
-	// Sign/zero extend result (w0)
-	switch (size)
-	{
-		case 8:
-			if (sign)
-				armAsm->Sxtb(RWARG1, RWARG1);
-			else
-				armAsm->Uxtb(RWARG1, RWARG1);
-			break;
-		case 16:
-			if (sign)
-				armAsm->Sxth(RWARG1, RWARG1);
-			else
-				armAsm->Uxth(RWARG1, RWARG1);
-			break;
-		case 32:
-			break; // no extension needed
-	}
-
-	// Store result to destination register
-	armStorePsxRegPtr(RWARG1, &psxRegs.GPR.r[_Rt_]);
+	_clearNeededArm64GPRregs();
+	if (_Rt_)
+		PSX_DEL_CONST(_Rt_);
 }
 
 // Emit the C fallback for a store — address in w0, value in w1.
 static void rpsxEmitStoreCall(int size)
 {
+	psxEmitSpill();
 	switch (size)
 	{
 		case 8:  armEmitCall((void*)iopMemWrite8);  break;
 		case 16: armEmitCall((void*)iopMemWrite16); break;
 		case 32: armEmitCall((void*)iopMemWrite32); break;
 	}
+	psxEmitReload();
 }
 
 static void rpsxStoreGeneric(int size)
@@ -798,7 +777,9 @@ static void rpsxLWL()
 	armAsm->Sub(a64::sp, a64::sp, 16);
 	armAsm->Str(RWSCRATCH, a64::MemOperand(a64::sp));
 
+	psxEmitSpill();
 	armEmitCall((void*)iopMemRead32);              // w0 = mem (aligned word)
+	psxEmitReload();
 
 	armAsm->Ldr(a64::w1, a64::MemOperand(a64::sp));
 	armAsm->Add(a64::sp, a64::sp, 16);
@@ -835,7 +816,9 @@ static void rpsxLWR()
 	armAsm->Sub(a64::sp, a64::sp, 16);
 	armAsm->Str(RWSCRATCH, a64::MemOperand(a64::sp));
 
+	psxEmitSpill();
 	armEmitCall((void*)iopMemRead32);              // w0 = mem
+	psxEmitReload();
 
 	armAsm->Ldr(a64::w1, a64::MemOperand(a64::sp));
 	armAsm->Add(a64::sp, a64::sp, 16);
@@ -874,7 +857,9 @@ static void rpsxSWL()
 	armAsm->Str(RWARG1, a64::MemOperand(a64::sp, 0));
 	armAsm->Str(RWSCRATCH, a64::MemOperand(a64::sp, 4));
 
+	psxEmitSpill();
 	armEmitCall((void*)iopMemRead32);              // w0 = mem
+	psxEmitReload();
 
 	// Reload shift_input and aligned addr; mem stays in w0.
 	armAsm->Ldr(a64::w1, a64::MemOperand(a64::sp, 4));  // w1 = shift_input
@@ -902,7 +887,9 @@ static void rpsxSWL()
 	armAsm->Ldr(RWARG1, a64::MemOperand(a64::sp, 0)); // w0 = aligned addr
 	armAsm->Add(a64::sp, a64::sp, 16);
 
+	psxEmitSpill();
 	armEmitCall((void*)iopMemWrite32);
+	psxEmitReload();
 }
 
 static void rpsxSWR()
@@ -918,7 +905,9 @@ static void rpsxSWR()
 	armAsm->Str(RWARG1, a64::MemOperand(a64::sp, 0));
 	armAsm->Str(RWSCRATCH, a64::MemOperand(a64::sp, 4));
 
+	psxEmitSpill();
 	armEmitCall((void*)iopMemRead32);              // w0 = mem
+	psxEmitReload();
 
 	armAsm->Ldr(a64::w1, a64::MemOperand(a64::sp, 4));
 	armAsm->Lsl(a64::w1, a64::w1, 3);              // w1 = shift
@@ -942,7 +931,9 @@ static void rpsxSWR()
 	armAsm->Ldr(RWARG1, a64::MemOperand(a64::sp, 0));
 	armAsm->Add(a64::sp, a64::sp, 16);
 
+	psxEmitSpill();
 	armEmitCall((void*)iopMemWrite32);
+	psxEmitReload();
 }
 
 ////////////////////////////////////////////////////////////////////
@@ -1192,7 +1183,9 @@ static void rpsxRFE()
 	armAsm->Bfi(RWSCRATCH, RWARG1, 0, 4);          // replace low 4 bits of Status
 	armStorePsxRegPtr(RWSCRATCH, &psxRegs.CP0.n.Status);
 
+	psxEmitSpill();
 	armEmitCall((void*)iopTestIntc);
+	psxEmitReload();
 }
 
 ////////////////////////////////////////////////////////////////////

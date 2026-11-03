@@ -31,6 +31,7 @@
 #include <optional>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace IopThread
 {
@@ -103,6 +104,7 @@ namespace IopThread
 		inline constexpr u16 VBlankEnd = 3; // psxVBlankEnd()
 		inline constexpr u16 IopIrq = 4; // iopIntcIrq(arg)
 		inline constexpr u16 Call = 5; // the job whose number is arg (E2IJob)
+		inline constexpr u16 SifPump = 6; // the pump of an EE-started SIF DMA, deferred (DeferSifPump); arg is the channel, 0 for SIF0 and 1 for SIF1
 	} // namespace E2IKind
 
 	/// The once-a-frame jobs the EE runs for IOP devices.
@@ -123,6 +125,9 @@ namespace IopThread
 		void (*vblank_end)();
 		void (*iop_irq)(u32 line);
 		void (*job)(u32 job);
+		/// Last, so a table written before the kind existed is still a valid initializer. A SifPump item finds
+		/// it null only in a table that never posts one.
+		void (*sif_pump)(u32 channel);
 	};
 	extern const E2IActions kRealE2IActions;
 
@@ -137,6 +142,32 @@ namespace IopThread
 	/// applied it. With no IOP thread (a mode switch or shutdown in progress, or Off) the item is applied
 	/// here, directly. EE thread only.
 	void ApplyOnIop(u16 kind, u32 arg = 0);
+
+	/// EE thread. The EE has started a SIF DMA (SIF0 or SIF1, `channel` 0 or 1) and is about to run its pump. If
+	/// the IOP thread is to defer pumps, posts a SifPump item stamped with the EE's cycle and returns true: the
+	/// caller must not run the pump. The IOP applies the item when its clock reaches the stamp and runs the pump
+	/// through CallOnEE (RunSifPumpOnEe), so the EE blocks for nothing and the data moves at the IOP's time of the
+	/// start. False when the caller should run the pump itself, holding the IOP as before: no IOP thread, the IOP
+	/// already stopped (a hold, inside a CallOnEE function), or deferral not wanted.
+	///
+	/// Deferral is wanted in Threaded when EmuConfig.Speedhacks.iopThreadDeferSif is set, and in Lockstep when
+	/// it is set too (the item is then applied at once, which is Off's order).
+	bool DeferSifPump(u32 channel);
+
+	/// EE thread. The EE is about to stop a SIF channel that is running: a write of STR=0 to D5_CHCR or D6_CHCR (`channel` 0 for SIF0, 1 for
+	/// SIF1). The BIOS's sceSifSetDma does this at every call, to make room for its next transfer, and rebuilds the channel from the registers
+	/// the stop leaves. A transfer in flight may be waiting for the IOP: the IOP has not yet re-armed its DMA 9 or 10 after the transfer before.
+	/// On a console the IOP did that within microseconds, so by the time of the next call the transfer is done; an IOP that runs behind the EE
+	/// has not got there, and the stop cuts the transfer in the middle of a block, saves the rest as a new tag, and cancels the completion
+	/// interrupt. The IOP then gets a stream whose block boundaries are not where its tags say, and the BIOS's count of finished transfers is
+	/// one short for good.
+	///
+	/// So the IOP is brought up to the EE's cycle first, as for a pump the EE starts (a Threaded hold, a Lockstep catch-up), and a transfer it
+	/// then finishes completes before the stop. True when the IOP was brought up, and the caller should deliver a completion interrupt that
+	/// the transfer scheduled meanwhile instead of letting the stop cancel it. False, and nothing done, in Off, with no IOP thread, with the
+	/// IOP already stopped (a hold, a CallOnEE function), and in Lockstep without a skew or with that channel's holds off (the skew test arms
+	/// that defer the pump).
+	bool SyncIopForSifChannelStop(u32 channel);
 
 	/// Any thread. For a host thread that calls into IOP state directly and cannot take a hold (the
 	/// physical-disc thread's new-disc callback). With an IOP thread running, queues `command` for it and
@@ -209,6 +240,35 @@ namespace IopThread
 		return true;
 	}
 
+	/// The near bound: called by the EE before it reads or writes an SBUS mailbox word (HwRead.cpp, HwWrite.cpp).
+	/// In Threaded with a lag bound above kDefaultLag it waits until the IOP is within kDefaultLag of `cycle`, so
+	/// the mailbox handshakes (an IOP reboot makes many; gameplay makes none) see the skew they were tested at.
+	/// One load of the mode otherwise.
+	__forceinline_odr void EeSbusNearBound(u64 cycle)
+	{
+		const IopThreadMode mode = GetMode();
+		if (mode == IopThreadMode::Off) [[likely]]
+			return;
+		if (!g_thread.IsRunning()) [[unlikely]]
+			return;
+		// An IOP reboot handshakes through these words; the lag rules hold the bound tight for a while after one.
+		g_thread.NoteEeMailboxAccess(cycle);
+		if (mode == IopThreadMode::Threaded)
+			g_thread.CheckNearLag(cycle);
+	}
+
+	/// EE thread. The EE started a SIF DMA on `channel` (0: it armed SIF0 to receive, 1: it sent on SIF1), before its pump runs. A request
+	/// went out, so the lag rules hold the bound tight until the reply (LagRule::Window, IdleOutstanding). A load of the mode in Off.
+	void EeNoteSifStart(u32 channel);
+
+	/// EE thread. The EE read the status of D5 or D6 (CHCR) with STR set: it polls for the end of a SIF transfer, which may be waiting
+	/// for the IOP (LagRule::Poll).
+	void EeNoteSifPoll();
+
+	/// The SIF0 pump the IOP starts: the data and the completion reach the EE. Counts as the IOP's reply for the lag rules, then pumps.
+	/// Runs on the EE thread (Threaded: through CallOnEE).
+	void Sif0PumpFromIop();
+
 	/// A SIF pump that the IOP starts. The pump moves data on both sides and schedules both sides' completion
 	/// events, so it runs on the EE thread with the IOP stopped: the IOP posts it with CallOnEE and blocks until the
 	/// EE has run it (at its next event test, or sooner inside any EE wait). On the EE thread it just runs.
@@ -218,10 +278,50 @@ namespace IopThread
 	/// The minimum Threaded slice size (S_min) for the next Start(); 0 by default. Not a setting.
 	void SetThreadedMinSlice(s32 min_slice);
 	s32 ThreadedMinSlice();
+	/// Lockstep, for testing only (eerunner --iop-lockstep-skew; not a setting). The IOP is kept `cycles` EE cycles behind
+	/// the EE at every handoff instead of being brought up to it, E2I items are applied when the IOP's clock reaches their
+	/// stamp, and EE-started SIF0/SIF1 pumps are deferred as with iopThreadDeferSif. Every run of a state with the same
+	/// skew is the same run. 0, the default, is Lockstep as before, bit for bit. Takes effect at the next Start() of a Lockstep
+	/// thread; clamped to 0..kMaxLag.
+	///
+	/// What stays direct: the EE's reads and writes of IOP address space and its SIF2 pumps still touch the IOP where it
+	/// is, D behind, and the SBUS words are live. The mode is for states whose play makes none of them. Do not take or load
+	/// a savestate, or change settings, during a skewed run: the items still queued for the IOP are not part of a state.
+	void SetLockstepSkew(s64 cycles);
+	s64 LockstepSkewSetting();
+	/// Lockstep skew, for testing only (eerunner --iop-lockstep-skew-holds; not a setting). With a skew above 0 the EE-started SIF0/SIF1
+	/// pumps are not deferred but HELD, as a Threaded hold does them: the EE runs the IOP up to its own cycle (applying the items due on the
+	/// way), runs the combined pump at once, and the skew then re-grows as the EE runs on (the IOP does not run again until the EE is a
+	/// skew ahead of it). So the pump reads and writes EE memory at the EE's cycle of the start, as on a console, and the IOP side of it
+	/// happens at the EE's time and not a skew late. Does nothing with a skew of 0. Takes effect at once.
+	void SetLockstepSkewHolds(bool holds);
+	/// The same per channel: bit 0 holds SIF0 pumps, bit 1 SIF1 pumps; the channel without its bit is deferred as before. 3 is
+	/// SetLockstepSkewHolds(true). eerunner --iop-lockstep-skew-holds-sif0 / -sif1. For finding which channel's deferral matters.
+	void SetLockstepSkewHoldChannels(u32 mask);
+	bool LockstepSkewHolds();
+	/// The skew the running Lockstep thread has, 0 otherwise. What the EE core's event test reads.
+	inline s32 LockstepSkewCycles() { return static_cast<s32>(g_thread.LockstepSkewCurrent()); }
+
+	/// Keep a record of every frame's late replies (IOPLATE-FRAME: lines in eerunner), for the next Start(). Not a setting.
+	void SetReplyTrace(bool on);
+	bool ReplyTrace();
+
+	/// IOP thread, Lockstep, with the EE blocked in the handoff: the IOP has an effect on the EE directly, where Threaded queues an
+	/// item (the SBUS interrupt, a SIF pump the IOP started). Counts it as a reply of `kind` (ReplyKind) at the IOP's time now. Does
+	/// nothing in any other mode.
+	void NoteDirectReply(u32 kind);
+
 	/// The idle-watch window for the next Start(): how long an idle IOP watches the watermark before it sleeps
 	/// (Params::idle_spin_ns; default kDefaultIdleSpinNs). Not a setting.
 	void SetThreadedIdleSpinNs(u32 ns);
 	u32 ThreadedIdleSpinNs();
+
+	/// The late-reply books as text, for the run reports: a total line, a line per kind for every reply and for the overshoots in idle (count, mean,
+	/// max, and the histogram of lateness), the idle share of the late replies in tenths, and the frames by overshoots in idle.
+	/// Each line starts with IOPLATE:.
+	std::vector<std::string> FormatReplyStats(const ReplyStats& stats);
+	/// One IOPLATE-FRAME: line per completed frame, when the trace is on.
+	std::vector<std::string> FormatReplyTrace(const std::vector<FrameRecord>& trace);
 
 	/// One line of the Threaded counters, per frame over the time since the last call, for the OSD. Empty unless
 	/// the mode is Threaded.

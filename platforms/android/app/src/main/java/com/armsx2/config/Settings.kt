@@ -117,13 +117,20 @@ data class CpuSettings(
      *  so testers can A/B games which dislike MTVU. */
     val mtvu: Boolean = true,
     /** EmuCore/Speedhacks/iopThread — runs the IOP (the PS2's I/O processor: sound, disc, controllers
-     *  and memory cards) on its own thread beside the EE. Off by default. The core turns it back off by
-     *  itself on a device without spare performance cores, for PS1 games, arcade games and while an IOP
+     *  and memory cards) on its own thread beside the EE. This plain default is off; a new install and a Reset take
+     *  the device's (DeviceTier.iopThreadDefault: on where the performance tier is two or three cores), and an older
+     *  install is moved once (ConfigStore.migrateIopThreadNarrowTier). The game database turns it on for a few games
+     *  that need it (God of War, God of War II, Shadow of the Colossus). The core turns it off by itself on a device
+     *  with fewer than two performance cores or too few cores in total, for PS1 games, arcade games and while an IOP
      *  breakpoint is set, so the switch can stay on everywhere. */
     val iopThread: Boolean = false,
     /** EmuCore/Speedhacks/iopThreadLag — how many EE cycles the EE may run ahead of the IOP thread before
-     *  it waits for it. Advanced. The core clamps it to 4096..196608; keep the pickers inside that. */
-    val iopThreadLag: Int = 24576,
+     *  it waits for it. Advanced. The core clamps it to 4096..9830400 (two frames); keep the pickers inside that.
+     *  The default is one frame, 4915200 cycles (IopThread::kDefaultSettingLag in IopThreadMode.h); the core pulls
+     *  the bound back to 24576 by itself at the moments the EE is waiting on the IOP. A save that still holds the
+     *  old default, 24576, is moved to the new one once (ConfigStore.migrateIopThreadLag); any other saved value
+     *  stays as it was saved. */
+    val iopThreadLag: Int = 4915200,
     /** EmuCore/CPU/Recompiler/EnableVUAot — vu-aot, the VU1 ahead-of-time compiler. Programs that run often
      *  are recompiled in the background above microVU, and the compiled VU code is kept on disk (the VU
      *  program cache comes up with it) so the next launch starts with it. On by default. Turning it off

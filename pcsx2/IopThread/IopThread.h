@@ -112,19 +112,28 @@
 //  - A missed wake-up is recovered by the spin that follows it (above).
 //  - In Lockstep the IOP never waits on the EE at all: it calls EE code directly while the EE is
 //    in the handoff.
+//  - A deferred SIF pump (a SifPump item, IopThreadVm.h) is one more CallOnEE, made from ApplyDueItems on
+//    the IOP's own turn: from the pacing loop, or from the catch-up of a hold, which the EE spends in the
+//    hold's spin, draining. The EE posts the item and goes on; it never waits for the IOP to apply it. A
+//    hold that the EE takes while such an item is queued has its catch-up apply the item first (the stamp
+//    is at or before the hold's cycle), so every item is gone by the time the hold is granted.
 //
 // A function given to CallOnEE therefore must not wait for the IOP. That is a rule on callers.
 
 #pragma once
 
 #include "IopThread/IopChannels.h"
+#include "IopThread/IopLagControl.h"
+#include "IopThread/IopLagRules.h"
 #include "IopThread/IopThreadMode.h"
 
 #include "common/FPControl.h"
 #include "common/Pcsx2Defs.h"
 #include "common/Threading.h"
 
+#include <algorithm>
 #include <atomic>
+#include <deque>
 #include <functional>
 #include <thread>
 #include <type_traits>
@@ -223,14 +232,30 @@ namespace IopThread
 		/// The caller clamps it (ClampLag); the object takes it as given so a test can use any.
 		s32 lag = kDefaultLag;
 
+		/// The rules that tighten the bound while the EE waits for the IOP (IopLagRules.h). With mask 0, or a lag at or below
+		/// the tight bound, the bound is the lag, as it was before the rules existed.
+		LagRulesConfig rules;
+
 		/// S_min: the IOP waits until its budget reaches this many cycles before it runs a slice,
 		/// unless an item is due at the end of the slice, an IOP event is pending or the EE is
 		/// spinning. 0, the default, runs whenever there is budget.
 		s32 min_slice = 0;
 
+		/// Lockstep only, and for tests: the IOP is kept this many EE cycles behind the EE at every handoff instead of
+		/// being brought up to it, and E2I items are applied when the IOP's own clock reaches their stamp instead of at
+		/// the moment they are posted. 0, the default, is Lockstep as it has always been. The caller clamps it to at most
+		/// kMaxLag. Items the E2I ring cannot hold go to a spill queue (m_e2i_spill). Ignored in Threaded.
+		///
+		/// A handoff then runs `run_slice` towards min(EE cycle - skew, next item's stamp), item by item, so the budget
+		/// has to come from the target and not from the EE's books (the Threaded slice, not the Lockstep one); the
+		/// caller writes the books from the position the handoff returns.
+		s64 lockstep_skew = 0;
+
 		/// Where the clocks start: the EE's cycle (the first watermark) and the IOP's position.
 		u64 start_ee_cycle = 0;
 		u64 start_iop_pos = 0;
+		/// The frame count at Start(): LagRule::Boot counts its frames from here.
+		u32 start_frame = 0;
 
 		/// The IOP thread's floating-point control register: EmuConfig.Cpu.FPUFPCR.
 		FPControlRegister fpcr = FPControlRegister::GetDefault();
@@ -254,8 +279,17 @@ namespace IopThread
 		/// work even with a zero budget.
 		std::function<bool()> has_event;
 
+		/// Optional. The IOP's position in EE cycles right now, from inside a slice: how far `run_slice` has got, to the
+		/// precision of a block. PostI2E stamps its items with it (I2EItem::stamp). Empty takes the position at the start
+		/// of the slice, which is as exact as an IOP with no clock inside its slice can be.
+		std::function<u64()> iop_now;
+
 		/// Optional. Receives the E2IKick bits raised since the last call.
 		std::function<void(u32 kicks)> apply_kicks;
+
+		/// Optional. The IOP's devices as StreamBit bits (SPU2 auto-DMA, a CDVD read), sampled at the end of every slice and
+		/// published to the EE for LagRule::Stream. Empty means no stream is ever running.
+		std::function<u32()> sample_streams;
 
 		// ---- run on the EE thread
 
@@ -267,6 +301,10 @@ namespace IopThread
 		/// The EE's current cycle (cpuRegs.cycle). ScopedHold takes its target from it. If empty,
 		/// the last published watermark is used.
 		std::function<u64()> ee_cycle;
+
+		/// Optional. EE thread. True while the EE is inside an event test: a reply taken then can be an overshoot in idle
+		/// (ReplyMonitor::OnReply). Empty counts every reply as taken inside one.
+		std::function<bool()> ee_in_event_test;
 
 		/// Optional. Called on the EE thread when an outermost hold has been granted, with the IOP stopped
 		/// at its position and the I2E queue emptied once more. The VM uses it to rewrite the EE-side books
@@ -306,6 +344,10 @@ namespace IopThread
 		u64 emu_hold_requests; // ... of which on the emulation path: EE access to IOP space, SIF pumps, the PS1 switch
 		u64 emu_hold_stall_ns; // wall time the EE spent waiting for those
 		u64 sif_ee_pumps; // SIF pumps the EE started (each one took an Emulation hold)
+		u64 sif_deferred; // SIF pumps the EE started and did not hold for: posted as a SifPump item (iopThreadDeferSif, a Lockstep skew)
+		u64 near_waits; // SBUS mailbox accesses that had to wait for the near bound (lag above the default)
+		u64 near_wait_iterations;
+		u64 near_wait_ns; // wall time spent in those waits
 		u64 hold_markers; // holds that were only a counter: Lockstep, nested, inside a CallOnEE function, no thread
 		u64 hold_spin_iterations;
 		u64 hold_sleeps; // polling sleeps of a Lifecycle hold
@@ -318,6 +360,19 @@ namespace IopThread
 		u64 wakes_dropped; // ... and ones Params::drop_wake lost
 		u64 stop_checks; // calls of Params::should_stop
 		u64 handoffs; // Lockstep requests
+		u64 ee_event_tests; // event tests the EE made with this thread running (NoteEventTest)
+		u64 ee_ff_wait_loop; // ... of which were reached through a recompiler wait loop fast-forward
+		u64 ee_ff_timeout_loop; // ... through a recompiler timeout loop skip
+		u64 ee_ff_interpreter; // ... through the interpreter's wait loop skip
+		u64 replies; // what the IOP produced for the EE and the EE took (the SBUS interrupt, the SIF pumps the IOP started)
+		u64 late_replies; // ... late by at least kOvershootMin EE cycles
+		u64 idle_overshoots; // ... of which the EE took in an idle event test, idle since the reply was produced (ReplyMonitor)
+		u64 idle_overshoot_cycles; // their lateness, summed
+		u64 idle_overshoot_max; // and the largest
+		u64 late_ee_busy; // late replies taken while the EE was not idle
+		u64 late_idle_light; // late replies taken in an idle event test with less than kIdleShareMin percent of the lateness idle
+		u64 idle_overshoots_unbroken; // idle overshoots read strictly: no EE run between the production and now
+		u64 idle_overshoots_90; // ... and read with a 90 percent idle share
 		// IOP thread
 		u64 slices;
 		u64 items_applied;
@@ -327,6 +382,7 @@ namespace IopThread
 		u64 calls_cancelled;
 		u64 i2e_full_waits; // PostI2E calls that found the queue full
 		u64 kicks_applied;
+		u64 sif_deferred_applied; // SifPump items the IOP applied (each is one CallOnEE: the IOP waits for the EE to run the pump)
 		u64 lag_spins_idle; // EE: lag spins that found the IOP idle and awake (watching the watermark)
 		u64 lag_idle_stall_ns; // EE: ... and their wall time
 		u64 idle_waits; // IOP: times the pacing loop went idle
@@ -406,16 +462,72 @@ namespace IopThread
 				WakeAfterPublish(cycle);
 		}
 
+		/// EE thread, first thing in every event test of a Lockstep or Threaded EE (after the stopping check). `ff_kind` is the
+		/// FastForward bits (IopThreadMode.h) the skip that ended in this event test left, 0 when the EE got here by running. An event test
+		/// reached by a fast-forward is one the EE spent idle: the guest was waiting and its clock was jumped to the next event.
+		__fi void NoteEventTest(u64 cycle, u8 ff_kind, u32 frame)
+		{
+			m_ee_event_tests.Add();
+			if (ff_kind != 0) [[unlikely]]
+			{
+				if (ff_kind & FastForward::WaitLoop)
+					m_ee_ff_wait_loop.Add();
+				if (ff_kind & FastForward::TimeoutLoop)
+					m_ee_ff_timeout_loop.Add();
+				if (ff_kind & FastForward::Interpreter)
+					m_ee_ff_interpreter.Add();
+			}
+			m_replies.OnEventTest(cycle, ff_kind != 0, frame);
+			m_ev_idle = ff_kind != 0;
+			m_ev_frame = frame;
+			// Lockstep with a skew: the IOP is kept `skew_cur` behind at this event test's handoff. Threaded asks the rules at the
+			// lag check instead, after the event test has drained what the IOP queued.
+			if (m_lockstep_skew > 0) [[unlikely]]
+			{
+				m_lockstep_skew_cur = m_lockstep_skew;
+				if (m_rules.Live(m_lockstep_skew))
+					m_lockstep_skew_cur = std::min<s64>(m_lockstep_skew, m_rules.Bound(cycle, m_ev_idle, m_streams.load(std::memory_order_relaxed), frame, m_lockstep_skew));
+			}
+		}
+
+		/// EE thread, or the IOP thread in Lockstep with the EE blocked in the handoff. The EE takes something the IOP produced
+		/// (ReplyKind) at the IOP time whose low 32 bits are `stamp_lo`, at the EE's cycle now (Params::ee_cycle). Threaded counts
+		/// its I2E items and CallOnEE requests itself; the VM calls this for the effects a Lockstep IOP has on the EE directly.
+		ReplyMonitor::Verdict NoteReply(u32 kind, u32 stamp_lo)
+		{
+			const u64 now = m_params.ee_cycle ? m_params.ee_cycle() : m_ee_wm_local;
+			const bool in_event_test = m_params.ee_in_event_test ? m_params.ee_in_event_test() : true;
+			return m_replies.OnReply(kind, stamp_lo, now, in_event_test);
+		}
+
+		/// The late-reply books. Read them when the EE (and in Lockstep the IOP) is not running, or accept a snapshot a moment old.
+		const ReplyMonitor& Replies() const { return m_replies; }
+		/// Keep a record of every frame (before Start(), which resets the books and keeps this).
+		void SetReplyTrace(bool on) { m_replies.EnableTrace(on); }
+
 		/// Returns once cycle - iop_pos <= lag, so the EE is never more than L ahead after an
 		/// event test. Spins (see the top of this file) while it waits. False if the stop predicate
 		/// ended the wait; the lag is then unmet and the caller must not carry on as if it held.
 		/// Returns true at once when the IOP is held or stopped, since it cannot catch up.
-		__fi bool CheckLag(u64 cycle)
+		__fi bool CheckLag(u64 cycle) { return CheckLagTo(cycle, LagBound(cycle), false); }
+
+		/// The bound in force at an event test at `cycle`: L, or the tight bound while a rule holds (IopLagRules.h).
+		__fi s64 LagBound(u64 cycle)
+		{
+			if (!m_rules.Live(m_lag)) [[likely]]
+				return m_lag;
+			return m_rules.Bound(cycle, m_ev_idle, m_streams.load(std::memory_order_relaxed), m_ev_frame, m_lag);
+		}
+
+		/// CheckLag with the bound given. The fast path is the same: one compare against the last position seen.
+		/// `near_bound` says the wait is not the lag bound (the SBUS near bound, CheckNearLag), which keeps its
+		/// time out of the lag statistics.
+		__fi bool CheckLagTo(u64 cycle, s64 bound, bool near_bound)
 		{
 			// The position only moves forward (Resync moves it only under a hold, and updates the copy), so
 			// a bound that holds against the last position seen holds against the current one, and the EE
 			// does not have to read the IOP's line.
-			if (static_cast<s64>(cycle - m_last_seen_iop_pos) <= m_lag) [[likely]]
+			if (static_cast<s64>(cycle - m_last_seen_iop_pos) <= bound) [[likely]]
 				return true;
 			// Pairs with the release store of iop_pos in the IOP's loop: the EE goes on past the bound, and
 			// trusts this position at later event tests, only after the IOP's work up to it. A relaxed load
@@ -426,9 +538,22 @@ namespace IopThread
 			const u64 pos = m_iop.pos_pub.load(std::memory_order_relaxed);
 			std::atomic_thread_fence(std::memory_order_acquire);
 			m_last_seen_iop_pos = pos;
-			if (static_cast<s64>(cycle - pos) <= m_lag) [[likely]]
+			if (static_cast<s64>(cycle - pos) <= bound) [[likely]]
 				return true;
-			return LagSpin(cycle);
+			return LagSpin(cycle, bound, near_bound);
+		}
+
+		/// The near bound for the EE's accesses to the SBUS mailbox words (F200..F260). Those words are live
+		/// shared memory, not queued items, so with a lag bound far above the default the IOP could read an EE
+		/// write up to L cycles early in its own time, and the EE could read an IOP write that late. When L is above
+		/// kDefaultLag this waits until the IOP is within kDefaultLag of `cycle`, which is the skew the mailbox
+		/// handshakes of an IOP reboot were tested at. At or below kDefaultLag the event test's bound already
+		/// holds and this returns at once. False if the stop predicate ended the wait.
+		__fi bool CheckNearLag(u64 cycle)
+		{
+			if (m_lag <= kDefaultLag) [[likely]]
+				return true;
+			return CheckLagTo(cycle, kDefaultLag, true);
 		}
 
 		/// Queues an item stamped `stamp` (the EE's cycle at the moment) for the IOP, publishes the
@@ -459,6 +584,28 @@ namespace IopThread
 		/// Returns the cycle the IOP reached. The IOP thread runs it with the EE blocked here, so
 		/// it may call EE code directly. Host commands run at the start of each handoff.
 		u64 LockstepRunSlice(u64 target);
+
+		/// The skew this Lockstep thread was started with (Params::lockstep_skew), 0 in Threaded and with no thread. With
+		/// a skew above 0, LockstepRunSlice(target) runs the IOP to target - skew, applying the items that fall due on the
+		/// way, and LockstepApplyUpTo() must not be used. EE thread.
+		s64 LockstepSkew() const { return m_lockstep_skew; }
+		/// The skew in force at the current event test: LockstepSkew(), or less while a lag rule holds the IOP closer. What the EE's
+		/// books and the handoff use.
+		s64 LockstepSkewCurrent() const { return m_lockstep_skew_cur; }
+
+		/// Lockstep skew only, testing. A hold: runs the IOP up to `ee_cycle` itself, whatever the skew (applying the items due on the
+		/// way, as the skewed slice does), and returns the cycle it reached, at or a little past `ee_cycle`. The next handoff's goal is
+		/// `ee_cycle - skew` again, so the IOP then waits for the EE to run a skew ahead of it: the skew re-grows as the EE runs on.
+		/// EE thread, Lockstep thread running.
+		u64 LockstepCatchUp(u64 ee_cycle);
+
+		/// How many catch-ups were made, and the EE cycles the IOP ran in them (what the skew had grown to, summed).
+		u64 LockstepCatchUps() const { return m_catchups; }
+		u64 LockstepCatchUpCycles() const { return m_catchup_cycles; }
+
+		/// Lockstep skew only: how many items went to the spill queue instead of the ring this run, and its deepest point.
+		u64 E2ISpillTotal() const { return m_e2i_spill_total; }
+		u64 E2ISpillMax() const { return m_e2i_spill_max; }
 
 		/// Hands the IOP thread the order "apply every queued item stamped at or before `stamp`"
 		/// whatever the IOP's position, and waits. Returns how many it applied. Lockstep applies an
@@ -508,6 +655,9 @@ namespace IopThread
 		bool EeSpinning() const { return m_ee.spinning.load(std::memory_order_relaxed); }
 		/// True on the IOP thread, between Start() and Stop().
 		bool OnIopThread() const { return m_iop_tid == std::this_thread::get_id(); }
+		/// IOP thread. The IOP's time in EE cycles at this moment (Params::iop_now, else the position at the start of the slice).
+		/// What an item it queues is stamped with.
+		u64 IopNow() const { return m_params.iop_now ? m_params.iop_now() : m_iop_pos; }
 		/// EE thread. How many ScopedHolds are live, nested ones included.
 		u32 HoldDepth() const { return m_hold_depth; }
 		/// EE thread. True while the EE runs a CallOnEE function: the IOP is blocked at a known point, as under a hold.
@@ -521,10 +671,28 @@ namespace IopThread
 		{
 			m_lag = lag;
 		}
+
+		// ---- The lag rules (IopLagRules.h). EE thread, except as noted.
+		LagRules& Rules() { return m_rules; }
+		const LagRules& Rules() const { return m_rules; }
+		/// The EE started a SIF transfer on `channel` (0 or 1).
+		void NoteEeSifStart(u64 cycle, u32 channel) { m_rules.OnEeSifStart(cycle, channel); }
+		/// A SIF0 transfer from the IOP reached the EE (on the EE thread; in Lockstep on the IOP thread with the EE blocked).
+		void NoteIopSif0Reply(u64 cycle) { m_rules.OnIopReply(cycle); }
+		/// The EE touched an SBUS mailbox word.
+		void NoteEeMailboxAccess(u64 cycle) { m_rules.OnMailboxAccess(cycle); }
+		/// The EE read the status of a SIF DMA channel that is running.
+		void NoteEePoll(u64 cycle) { m_rules.OnEePoll(cycle); }
+		/// What the IOP's devices are doing now (StreamBit bits); written by the IOP thread, read by the EE for LagRule::Stream.
+		u32 Streams() const { return m_streams.load(std::memory_order_relaxed); }
 		s32 Lag() const { return static_cast<s32>(m_lag); }
 
 		/// EE thread. Counts a SIF pump the EE started (it holds the IOP for the pump).
 		void CountSifPump() { m_sif_ee_pumps.Add(); }
+		/// EE thread. Counts a SIF pump the EE started and posted as an item instead of holding the IOP for it.
+		void CountSifDeferred() { m_sif_deferred.Add(); }
+		/// IOP thread. Counts a deferred pump item the IOP applied.
+		void CountSifDeferredApplied() { m_sif_deferred_applied.Add(); }
 
 		Stats GetStats() const;
 
@@ -543,6 +711,7 @@ namespace IopThread
 		{
 			kLsRunSlice,
 			kLsApplyUpTo,
+			kLsCatchUp, // Lockstep skew, testing: run the IOP to the EE's cycle itself, as a Threaded hold does
 		};
 
 		struct Plan
@@ -562,13 +731,17 @@ namespace IopThread
 		void RunOneSlice(u64 target);
 		void ApplyDueItems();
 		void ApplyKicks();
-		bool WaitForI2ESpace(u16 kind, u32 arg);
+		u64 LockstepSkewedSlice(u64 ee_cycle, s64 skew);
+		void SampleStreams();
+		bool PopDueE2I(u64 now, E2IItem& out);
+		u64 NextE2IStamp();
+		bool WaitForI2ESpace(u16 kind, u32 arg, u32 stamp);
 		bool CallOnEEImpl(void (*fn)(void*), void* arg);
 		template <class Ready>
 		void ParkUntil(Ready&& ready);
 
 		// ---- EE thread: the waits
-		bool LagSpin(u64 cycle);
+		bool LagSpin(u64 cycle, s64 bound, bool near_bound);
 		bool WaitForE2ISpace(u64 stamp, u16 kind, u32 arg);
 		void AcquireHold(HoldKind kind);
 		void ReleaseHold();
@@ -594,6 +767,8 @@ namespace IopThread
 		IopThreadMode m_mode = IopThreadMode::Off;
 		s64 m_lag = 0;
 		s64 m_min_slice = 0;
+		s64 m_lockstep_skew = 0; // Lockstep only; written by Start() and Stop()
+		s64 m_lockstep_skew_cur = 0; // Lockstep only; the skew in force, set by the EE at each event test (the handoff reads it)
 		u64 m_idle_spin_ns = 0;
 		bool m_use_membarrier = false; // the IOP's half of the sleep handshake
 
@@ -638,10 +813,28 @@ namespace IopThread
 		{
 			void (*fn)(void*) = nullptr;
 			void* arg = nullptr;
+			u32 stamp = 0; // the IOP's time of the request (the low 32 bits of IopNow()), written with fn and arg
 			std::atomic<u32> state{kCallIdle};
 		} m_call;
 
+		ReplyMonitor m_replies; // EE thread; in Lockstep also the IOP thread, with the EE blocked in the handoff
+		LagRules m_rules; // EE thread; in Lockstep also the IOP thread (a SIF0 reply), with the EE blocked in the handoff
+		bool m_ev_idle = false; // EE thread: the last event test was reached by a fast-forward
+		u32 m_ev_frame = 0; // EE thread: its frame count
+		std::atomic<u32> m_streams{0}; // written by the IOP thread at the end of a slice (StreamBit bits), read by the EE
+
 		StampedRing<kE2IRingCapacity> m_e2i;
+		// Lockstep skew only (a testing mode): the EE-to-IOP items that did not fit the ring, oldest first. A skewed IOP does not
+		// run until the EE is a skew ahead, so a burst of posts (a state whose counters have to catch up, a guest loop that starts
+		// a SIF DMA every few hundred cycles while the deferred pump is pending) can exceed any fixed capacity. Items go here once
+		// the ring is full and until this is empty again, so every item in it is newer than every item in the ring and the order
+		// holds. The EE appends while the IOP is parked in the handoff wait and the IOP consumes while the EE is blocked in the
+		// handoff, so the two never touch it at once. Never used with a skew of 0 or in Threaded.
+		std::deque<E2IItem> m_e2i_spill;
+		u64 m_catchups = 0; // LockstepCatchUp calls
+		u64 m_catchup_cycles = 0; // EE cycles the IOP ran in them
+		u64 m_e2i_spill_total = 0; // items that went to the spill
+		u64 m_e2i_spill_max = 0; // its deepest point
 		I2EQueue<kI2EQueueCapacity> m_i2e;
 		KickBits m_e2i_kicks;
 		HostCommandQueue m_host;
@@ -669,12 +862,14 @@ namespace IopThread
 		detail::Counter m_lag_stall_ns, m_lag_spins_parked, m_lag_parked_stall_ns, m_emu_hold_requests, m_emu_hold_stall_ns, m_sif_ee_pumps;
 		detail::Counter m_e2i_full_spins, m_e2i_full_iterations, m_e2i_full_failfast, m_i2e_drained, m_calls_served;
 		detail::Counter m_wakes_sent, m_wakes_dropped, m_stop_checks, m_handoffs, m_lag_spins_idle, m_lag_idle_stall_ns;
+		detail::Counter m_sif_deferred, m_near_waits, m_near_wait_iterations, m_near_wait_ns;
+		detail::Counter m_ee_event_tests, m_ee_ff_wait_loop, m_ee_ff_timeout_loop, m_ee_ff_interpreter;
 
 		// IOP-thread private, with the IOP's counters, on lines of their own. The EE writes m_iop_pos only
 		// under a hold or while stopped.
 		alignas(kChannelLineSize) u64 m_iop_pos = 0;
 		detail::Counter m_slices, m_items_applied, m_parks, m_holds_entered, m_calls_posted, m_calls_cancelled;
-		detail::Counter m_i2e_full_waits, m_kicks_applied, m_idle_waits, m_idle_ns;
+		detail::Counter m_i2e_full_waits, m_kicks_applied, m_idle_waits, m_idle_ns, m_sif_deferred_applied;
 	};
 
 	/// A full stop of the IOP, for the EE thread to touch IOP state safely. Re-entrant.

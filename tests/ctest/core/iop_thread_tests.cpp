@@ -1841,6 +1841,209 @@ namespace
 			EXPECT_EQ(received[i], i) << "the IOP-to-EE queue must keep its order";
 	}
 
+	TEST_F(IopThreadObject, AnI2EItemIsStampedWithTheIopsTimeWhenItWasProduced)
+	{
+		// The IOP's clock inside a slice is Params::iop_now. An item takes the time at the post, not the time it gets
+		// into the queue and not the time the EE takes it.
+		std::atomic<u64> clock{0};
+		fake.in_slice_hook = [&, once = false](u64, u64) mutable {
+			if (once)
+				return;
+			once = true;
+			clock.store(0x1'0000'1234ull);
+			thread->PostI2E(I2EKind::SbusIrq, 1);
+			clock.store(0x1'0000'5678ull);
+			thread->PostI2E(I2EKind::SbusIrq, 2);
+		};
+		std::vector<I2EItem> received;
+		Params p = BaseParams();
+		p.iop_now = [&] { return clock.load(); };
+		p.handle_i2e = [&](const I2EItem& item) { received.push_back(item); };
+		StopOnExit stop_on_exit(*thread);
+		ASSERT_TRUE(thread->Start(p));
+		Publish(100);
+		ASSERT_TRUE(WaitPos(100));
+		ASSERT_TRUE(WaitEe([&] {
+			if (thread->MayHaveI2E())
+				thread->DrainI2E();
+			return received.size() == 2;
+		}));
+		EXPECT_EQ(received[0].stamp, 0x1234u) << "the low 32 bits of the IOP's time";
+		EXPECT_EQ(received[1].stamp, 0x5678u);
+		const u64 now = 0x1'0000'9000ull; // the EE takes the item 0x9000 - 0x5678 cycles after it was produced, across the 2^32 wrap
+		EXPECT_EQ(static_cast<s32>(static_cast<u32>(now) - received[1].stamp), 0x9000 - 0x5678);
+	}
+
+	TEST_F(IopThreadObject, AnI2EItemWithNoIopClockIsStampedWithTheSliceStart)
+	{
+		fake.in_slice_hook = [&, once = false](u64 from, u64) mutable {
+			if (once || from == 0)
+				return;
+			once = true;
+			thread->PostI2E(I2EKind::SbusIrq, 9);
+		};
+		std::vector<I2EItem> received;
+		Params p = BaseParams();
+		p.handle_i2e = [&](const I2EItem& item) { received.push_back(item); };
+		StopOnExit stop_on_exit(*thread);
+		ASSERT_TRUE(thread->Start(p));
+		Publish(640);
+		ASSERT_TRUE(WaitPos(640));
+		Publish(1280);
+		ASSERT_TRUE(WaitPos(1280));
+		ASSERT_TRUE(WaitEe([&] {
+			if (thread->MayHaveI2E())
+				thread->DrainI2E();
+			return received.size() == 1;
+		}));
+		EXPECT_EQ(received[0].stamp, 640u) << "no iop_now: the position at the start of the slice that posted";
+	}
+
+	TEST_F(IopThreadObject, AnItemThatWaitedForRoomKeepsTheTimeItWasProduced)
+	{
+		constexpr u32 kItems = static_cast<u32>(kI2EQueueCapacity) + 20;
+		std::atomic<u64> clock{1000};
+		fake.in_slice_hook = [&, once = false](u64, u64) mutable {
+			if (once)
+				return;
+			once = true;
+			for (u32 i = 0; i < kItems; i++)
+			{
+				clock.store(1000 + i);
+				thread->PostI2E(I2EKind::SbusIrq, i);
+			}
+		};
+		std::vector<I2EItem> received;
+		Params p = BaseParams();
+		p.iop_now = [&] { return clock.load(); };
+		p.handle_i2e = [&](const I2EItem& item) { received.push_back(item); };
+		StopOnExit stop_on_exit(*thread);
+		ASSERT_TRUE(thread->Start(p));
+		Publish(100);
+		ASSERT_TRUE(WaitEe([&] { return thread->GetStats().i2e_full_waits >= 1; }));
+		std::this_thread::sleep_for(2ms);
+		ASSERT_TRUE(WaitEe([&] {
+			if (thread->MayHaveI2E())
+				thread->DrainI2E();
+			return received.size() == kItems;
+		}));
+		for (u32 i = 0; i < kItems; i++)
+			ASSERT_EQ(received[i].stamp, 1000u + i) << "item " << i << " (the ones past the capacity waited for room)";
+	}
+
+	TEST_F(IopThreadObject, AnSbusItemTheEeTakesLateInAnIdleEventTestIsCountedAsAnOvershoot)
+	{
+		fake.in_slice_hook = [&, once = false](u64, u64) mutable {
+			if (once)
+				return;
+			once = true;
+			thread->PostI2E(I2EKind::SbusIrq, 1); // produced at IOP time 5000 (iop_now below)
+		};
+		Params p = BaseParams();
+		p.iop_now = [] { return u64(5000); };
+		p.handle_i2e = [](const I2EItem&) {};
+		StopOnExit stop_on_exit(*thread);
+		ASSERT_TRUE(thread->Start(p));
+		Publish(100);
+		ASSERT_TRUE(WaitPos(100));
+		ASSERT_TRUE(WaitEe([&] { return thread->MayHaveI2E(); }));
+
+		// The EE idles from cycle 3000 on, event test after event test, and takes the item at 200,000.
+		thread->NoteEventTest(3000, 0, 1);
+		for (u64 c = 6072; c <= 200000; c += 3072)
+			thread->NoteEventTest(c, FastForward::WaitLoop, 1);
+		ee_cycle = 200000;
+		thread->NoteEventTest(ee_cycle, FastForward::WaitLoop, 1);
+		ASSERT_EQ(thread->DrainI2E(), 1u);
+
+		const Stats st = thread->GetStats();
+		EXPECT_EQ(st.replies, 1u);
+		EXPECT_EQ(st.late_replies, 1u);
+		EXPECT_EQ(st.idle_overshoots, 1u);
+		EXPECT_EQ(st.idle_overshoot_max, 195000u);
+		EXPECT_EQ(st.late_ee_busy, 0u);
+		const ReplyStats& r = thread->Replies().Stats();
+		EXPECT_EQ(r.all[ReplyKind::SbusIrq].count, 1u);
+		EXPECT_EQ(r.overshoot[ReplyKind::SbusIrq].count, 1u);
+		EXPECT_EQ(r.all[ReplyKind::SbusIrq].max, 195000u);
+		EXPECT_EQ(st.ee_ff_wait_loop, 65u);
+	}
+
+	TEST_F(IopThreadObject, TheSameItemTakenInAnEventTestTheEeRanIntoIsLateButBusy)
+	{
+		fake.in_slice_hook = [&, once = false](u64, u64) mutable {
+			if (once)
+				return;
+			once = true;
+			thread->PostI2E(I2EKind::SbusIrq, 1);
+		};
+		Params p = BaseParams();
+		p.iop_now = [] { return u64(5000); };
+		p.handle_i2e = [](const I2EItem&) {};
+		StopOnExit stop_on_exit(*thread);
+		ASSERT_TRUE(thread->Start(p));
+		Publish(100);
+		ASSERT_TRUE(WaitPos(100));
+		ASSERT_TRUE(WaitEe([&] { return thread->MayHaveI2E(); }));
+		for (u64 c = 3000; c < 200000; c += 3072)
+			thread->NoteEventTest(c, FastForward::WaitLoop, 1);
+		ee_cycle = 200000;
+		thread->NoteEventTest(ee_cycle, 0, 1); // the EE ran into this one
+		ASSERT_EQ(thread->DrainI2E(), 1u);
+		const Stats st = thread->GetStats();
+		EXPECT_EQ(st.late_replies, 1u);
+		EXPECT_EQ(st.idle_overshoots, 0u);
+		EXPECT_EQ(st.late_ee_busy, 1u);
+	}
+
+	TEST_F(IopThreadObject, ACallOnEeIsAReplyStampedWithTheIopsTimeOfTheRequest)
+	{
+		std::atomic<bool> called{false};
+		fake.in_slice_hook = [&, once = false](u64, u64) mutable {
+			if (once)
+				return;
+			once = true;
+			thread->CallOnEE([&] { called.store(true); });
+		};
+		Params p = BaseParams();
+		p.iop_now = [] { return u64(7000); };
+		StopOnExit stop_on_exit(*thread);
+		ASSERT_TRUE(thread->Start(p));
+		Publish(100);
+		thread->NoteEventTest(4000, 0, 1);
+		for (u64 c = 7072; c < 300000; c += 3072)
+			thread->NoteEventTest(c, FastForward::WaitLoop, 1);
+		ee_cycle = 300000;
+		thread->NoteEventTest(ee_cycle, FastForward::WaitLoop, 1);
+		ASSERT_TRUE(WaitEe([&] {
+			if (thread->MayHaveI2E())
+				thread->DrainI2E();
+			return called.load();
+		}));
+		const ReplyStats& r = thread->Replies().Stats();
+		EXPECT_EQ(r.all[ReplyKind::Call].count, 1u);
+		EXPECT_EQ(r.all[ReplyKind::Call].max, 293000u);
+		EXPECT_EQ(r.idle_overshoots, 1u);
+		EXPECT_EQ(r.overshoot[ReplyKind::Call].count, 1u);
+	}
+
+	TEST_F(IopThreadObjectLockstep, ADirectEffectOfALockstepIopIsCountedLikeAnItem)
+	{
+		Params p = BaseParams(IopThreadMode::Lockstep);
+		p.iop_now = [] { return u64(9000); };
+		StopOnExit stop_on_exit(*thread);
+		ASSERT_TRUE(thread->Start(p));
+		thread->NoteEventTest(5000, 0, 1);
+		for (u64 c = 8072; c <= 150000; c += 3072)
+			thread->NoteEventTest(c, FastForward::WaitLoop, 1);
+		ee_cycle = 150000;
+		thread->NoteEventTest(ee_cycle, FastForward::WaitLoop, 1);
+		const ReplyMonitor::Verdict v = thread->NoteReply(ReplyKind::Sif0Pump, static_cast<u32>(9000));
+		EXPECT_EQ(v.late, 141000u);
+		EXPECT_TRUE(v.overshoot);
+		EXPECT_EQ(thread->Replies().Stats().overshoot[ReplyKind::Sif0Pump].count, 1u);
+	}
+
 	TEST_F(IopThreadObject, ShutdownWhileTheIopWaitsForI2ESpaceCompletes)
 	{
 		bool all_posted = true;
@@ -2665,5 +2868,163 @@ namespace
 		EXPECT_EQ(stats.lag_spins, 1u);
 		EXPECT_EQ(stats.lag_spins_parked, 0u) << "the IOP was awake, watching the watermark";
 		EXPECT_EQ(stats.lag_spins_idle, 1u);
+	}
+	// ---- the lag rules (IopLagRules.h) at the thread object
+
+	// A Lockstep skew of a frame keeps the IOP a frame behind. With the idle-outstanding rule, an idle event test after the EE sent a
+	// request brings the IOP to within the tight bound, and a reply from the IOP lets the skew grow back.
+	TEST_F(IopThreadObjectLockstep, AnIdleEventTestWithARequestOutAndASkewKeepsTheIopWithinTheTightBound)
+	{
+		constexpr s64 kSkew = 400000;
+		constexpr s32 kTightBound = 8192;
+		Params p = BaseParams(IopThreadMode::Lockstep);
+		p.lockstep_skew = kSkew;
+		p.rules.mask = LagRule::Bit(LagRule::IdleOutstanding);
+		p.rules.tight = kTightBound;
+		p.rules.outstanding_max_age = 10'000'000;
+		StopOnExit stop_on_exit(*thread);
+		ASSERT_TRUE(thread->Start(p));
+
+		u64 cycle = 0;
+		const auto event_test = [&](bool idle) {
+			cycle += 3072;
+			ee_cycle = cycle;
+			thread->NoteEventTest(cycle, idle ? FastForward::WaitLoop : 0, 100);
+			return thread->LockstepRunSlice(cycle);
+		};
+
+		// No request out: the IOP stays a skew behind, idle or not.
+		for (int i = 0; i < 200; i++)
+			event_test(i % 2 == 0);
+		s64 behind = static_cast<s64>(cycle - thread->PublishedPos());
+		EXPECT_GE(behind, kSkew - fake.block);
+		EXPECT_EQ(thread->LockstepSkewCurrent(), kSkew);
+
+		// A request goes out. A busy event test keeps the skew; the first idle one brings the IOP up to the tight bound.
+		thread->NoteEeSifStart(cycle, 1);
+		event_test(false);
+		EXPECT_GE(static_cast<s64>(cycle - thread->PublishedPos()), kSkew - fake.block);
+		event_test(true);
+		behind = static_cast<s64>(cycle - thread->PublishedPos());
+		EXPECT_LE(behind, kTightBound);
+		EXPECT_GE(behind, kTightBound - fake.block);
+		EXPECT_EQ(thread->LockstepSkewCurrent(), kTightBound);
+
+		// The reply arrives: the next idle event test is loose again, and the skew grows back as the EE runs on.
+		thread->NoteIopSif0Reply(cycle);
+		for (int i = 0; i < 200; i++)
+			event_test(true);
+		EXPECT_EQ(thread->LockstepSkewCurrent(), kSkew);
+		behind = static_cast<s64>(cycle - thread->PublishedPos());
+		EXPECT_GE(behind, kSkew - fake.block);
+		EXPECT_LE(behind, kSkew);
+		EXPECT_EQ(thread->Rules().Stats().activations[LagRule::IdleOutstanding], 1u);
+	}
+
+	TEST_F(IopThreadObjectLockstep, WithNoRuleOnARequestChangesNothingUnderASkew)
+	{
+		constexpr s64 kSkew = 400000;
+		Params p = BaseParams(IopThreadMode::Lockstep);
+		p.lockstep_skew = kSkew;
+		StopOnExit stop_on_exit(*thread);
+		ASSERT_TRUE(thread->Start(p));
+		u64 cycle = 0;
+		for (int i = 0; i < 300; i++)
+		{
+			cycle += 3072;
+			ee_cycle = cycle;
+			if (i == 150)
+				thread->NoteEeSifStart(cycle, 1);
+			thread->NoteEventTest(cycle, FastForward::WaitLoop, 100);
+			thread->LockstepRunSlice(cycle);
+			EXPECT_EQ(thread->LockstepSkewCurrent(), kSkew);
+		}
+		const s64 behind = static_cast<s64>(cycle - thread->PublishedPos());
+		EXPECT_GE(behind, kSkew - fake.block);
+		EXPECT_LE(behind, kSkew);
+	}
+
+	// Threaded: the lag bound is a frame, the IOP is slow, and the EE has a request out and is idle. It may not run past the tight bound.
+	TEST_F(IopThreadObject, AnIdleEeWithARequestOutWaitsForTheIopWithinTheTightBoundAndABusyEeDoesNot)
+	{
+		constexpr s32 kLoose = 4915200;
+		constexpr s32 kTightBound = 8192;
+		Params p = BaseParams();
+		p.lag = kLoose;
+		p.rules.mask = LagRule::Bit(LagRule::IdleOutstanding);
+		p.rules.tight = kTightBound;
+		p.rules.outstanding_max_age = 100'000'000;
+		StopOnExit stop_on_exit(*thread);
+		ASSERT_TRUE(thread->Start(p));
+
+		// The IOP does not move until the EE is far ahead and a request is out: a gate in the first slice.
+		std::atomic<bool> release{false};
+		fake.in_slice_hook = [&](u64, u64) {
+			while (!release.load(std::memory_order_acquire) && !aborted.load(std::memory_order_relaxed))
+				std::this_thread::sleep_for(50us);
+		};
+		u64 cycle = 1'000'000;
+		Publish(cycle);
+		EXPECT_TRUE(thread->CheckLag(cycle)); // a busy EE a long way ahead: the loose bound
+		thread->NoteEventTest(cycle, 0, 100);
+		EXPECT_TRUE(thread->CheckLag(cycle));
+		EXPECT_EQ(thread->GetStats().lag_spins, 0u);
+
+		thread->NoteEeSifStart(cycle, 1);
+		cycle += 3072;
+		Publish(cycle);
+		thread->NoteEventTest(cycle, FastForward::WaitLoop, 100);
+		std::thread releaser([&] {
+			std::this_thread::sleep_for(20ms);
+			release.store(true, std::memory_order_release);
+		});
+		const auto begin = Clock::now();
+		EXPECT_TRUE(thread->CheckLag(cycle));
+		releaser.join();
+		EXPECT_GE(Clock::now() - begin, 15ms) << "the idle EE waited for the slow IOP";
+		EXPECT_LE(static_cast<s64>(cycle - thread->PublishedPos()), kTightBound);
+		EXPECT_EQ(thread->GetStats().lag_spins, 1u);
+	}
+	// SPU2 auto-DMA running on the IOP (the streams word the IOP thread samples at the end of each slice) holds a skewed IOP within the
+	// tight bound whatever the EE is doing, and lets the skew grow back when it stops.
+	TEST_F(IopThreadObjectLockstep, AnAutoDmaStreamKeepsASkewedIopWithinTheTightBoundUntilItStops)
+	{
+		constexpr s64 kSkew = 400000;
+		constexpr s32 kTightBound = 8192;
+		std::atomic<u32> streams{0};
+		Params p = BaseParams(IopThreadMode::Lockstep);
+		p.lockstep_skew = kSkew;
+		p.rules.mask = LagRule::Bit(LagRule::Stream);
+		p.rules.tight = kTightBound;
+		p.rules.stream_bits = StreamBit::SpuAdmaCore0;
+		p.sample_streams = [&] { return streams.load(); };
+		StopOnExit stop_on_exit(*thread);
+		ASSERT_TRUE(thread->Start(p));
+
+		u64 cycle = 0;
+		const auto event_test = [&] {
+			cycle += 3072;
+			ee_cycle = cycle;
+			thread->NoteEventTest(cycle, 0, 100); // a busy EE
+			thread->LockstepRunSlice(cycle);
+		};
+		for (int i = 0; i < 200; i++)
+			event_test();
+		EXPECT_GE(static_cast<s64>(cycle - thread->PublishedPos()), kSkew - fake.block);
+
+		// The stream starts: the IOP sees it at the end of its next slice, the EE at the event test after that.
+		streams.store(StreamBit::SpuAdmaCore0);
+		event_test();
+		event_test();
+		const s64 behind = static_cast<s64>(cycle - thread->PublishedPos());
+		EXPECT_LE(behind, kTightBound);
+		EXPECT_EQ(thread->LockstepSkewCurrent(), kTightBound);
+
+		// A disc read is not in the stream bits.
+		streams.store(StreamBit::CdvdBusy);
+		for (int i = 0; i < 200; i++)
+			event_test();
+		EXPECT_EQ(thread->LockstepSkewCurrent(), kSkew);
+		EXPECT_GE(static_cast<s64>(cycle - thread->PublishedPos()), kSkew - fake.block);
 	}
 } // namespace

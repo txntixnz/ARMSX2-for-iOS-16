@@ -7,8 +7,9 @@
 // and takes a place in the same plans.
 //
 // The same file holds the one rule shared with ResolveMode: which processors are the performance
-// tier. ResolveMode counts them to decide whether the host has a core to spare, and the Android
-// tier mode confines the emulation threads to them, so both read the same mask.
+// tier. ResolveMode needs the tier to be readable, the Android tier mode confines the emulation
+// threads to it, and a concurrent IOP thread is kept out of a tier that is too narrow for the
+// threads, so all of them read the same mask.
 
 #pragma once
 
@@ -65,6 +66,35 @@ namespace IopThread
 		bool back_thread_fits = false; // and one more for the GS back thread, which otherwise stays unpinned
 	};
 	TierPlan PlanTier(u64 performance_mask, bool mtvu, bool iop_thread);
+
+	/// Whether the Linux ordered thread pin (EnableThreadPinning) may be applied: false only when the performance tier can
+	/// be read and cannot hold the EE, GS and, with MTVU, VU1 threads. The pin hands out processors fastest first, so on
+	/// a tier of two it puts the GS thread on a slow core, and measured on the MQ65 with two fast cores it lost 30 to 45%
+	/// speed in every game. The IOP thread is not counted: it goes outside the tier (UnpinnedIopThreadMask). True when the
+	/// tier cannot be read (mask 0), which leaves a host that has no capacity source as it was.
+	bool OrderedPinAllowed(u64 performance_mask, bool mtvu);
+
+	/// Whether the game database's GS back-thread split fits on a host: the EE, VU1, GS front and GS back threads each
+	/// want a performance core, and a concurrent IOP thread wants a fifth. It is busy 40 to 99% of a core, and with it
+	/// running and only four big cores the split measured slower than a single GS thread in most games tried, even with
+	/// the prime core rule. There also has to be a slower core left to keep the rest off the tier: a host whose
+	/// every processor is in the tier (`performance_cores >= processors`) has none.
+	///
+	/// `iop_thread_threaded` is whether the IOP thread will actually run concurrently on this host, which is what
+	/// IopThread::ResolveMode says (Threaded), not whether the setting is on: on a host that can never give Threaded the
+	/// setting costs the split nothing.
+	bool GsSplitFits(u32 performance_cores, u32 processors, bool iop_thread_threaded);
+
+	/// The processors the IOP thread runs on when nothing places it on one of its own (the caller asks for "any
+	/// processor"), for a concurrent IOP thread on a host whose performance tier is narrower than the threads that want
+	/// it (PlanTier says the tier does not fit): every processor outside the tier. 0, meaning any processor, when the
+	/// IOP thread takes turns with the EE (Lockstep), when the tier cannot be read, when the tier has room for all the
+	/// threads, or when there is no processor outside it.
+	///
+	/// The thread spins while it waits for the EE. Left to float it spends part of its time on the big cores and
+	/// pushes the EE, GS and VU1 threads onto the little ones: on the RG 55G1 (two Cortex-A78, six Cortex-A55) 41% of
+	/// its cycles landed on the big cores when it floated.
+	u64 UnpinnedIopThreadMask(u64 performance_mask, u64 all_mask, bool mtvu, bool concurrent);
 
 	/// Android's ranked modes (1 to 6): each thread gets one processor from the list ordered fastest
 	/// first. ee, vu and gs are ranks; the caller clamps them to the list. The IOP thread

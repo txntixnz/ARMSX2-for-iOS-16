@@ -216,6 +216,7 @@ struct SetOverride
 };
 static std::vector<SetOverride> s_set_overrides; // --set Section/Key=Value (repeatable)
 static u32 s_iop_stats_every = 0;      // --iop-stats-every N: in a --liverun, log the IOP thread's Threaded counters every N frames
+static bool s_frame_limiter = false;   // --frame-limiter: a --liverun at the nominal frame rate (the limiter sleeps the EE as it does on a device)
 static bool s_stress = false;          // --iop-stress <seed>: a --liverun that does random lifecycle things between frames
 static u32 s_stress_seed = 1;
 static u32 s_pause_toggle_at = 0;      // --pause-toggle N: in a --liverun, flip the IOP thread setting while the VM is paused after frame N
@@ -1087,9 +1088,21 @@ static void PrintCommandLineHelp(const char* progname)
 	std::fprintf(stderr, "               frame N, as a settings dialog does on a paused VM, and log the mode and the thread before and after as PAUSE-TOGGLE:.\n");
 	std::fprintf(stderr, "  --iop-min-slice N: Threaded IOP thread: S_min, the budget in EE cycles the IOP lets build up before it runs a\n");
 	std::fprintf(stderr, "               slice (design 5.3). Default 0 (run whenever there is budget). A measurement knob, not a setting.\n");
+	std::fprintf(stderr, "  --iop-lockstep-skew N: Lockstep IOP thread (iopThread and iopThreadLockstep on): keep the IOP N EE cycles behind the EE\n");
+	std::fprintf(stderr, "               at every handoff instead of catching it up, apply EE-to-IOP items when the IOP's clock reaches their stamp, and\n");
+	std::fprintf(stderr, "               defer EE-started SIF0/SIF1 pumps. 0 (default) is plain Lockstep. Deterministic. A test knob, not a setting;\n");
+	std::fprintf(stderr, "               not for runs that save or load states.\n");
+	std::fprintf(stderr, "  --frame-limiter: in a --liverun, run at the nominal frame rate instead of unlimited, so the EE sleeps in the frame limiter as it does on a\n");
+	std::fprintf(stderr, "               device. A measurement knob.\n");
+	std::fprintf(stderr, "  --iop-late-trace: print an IOPLATE-FRAME: line per frame with that frame's late-reply counts (the IOPLATE: lines at the end of the run\n");
+	std::fprintf(stderr, "               are always printed with the IOP thread on). A measurement knob, not a setting.\n");
 	std::fprintf(stderr, "  --iop-spin-hint yield|isb: the instruction the Threaded spin loops use between looks (default yield).\n");
 	std::fprintf(stderr, "  --iop-idle-spin-us N: Threaded IOP thread: how long an idle IOP watches the watermark before it sleeps, in\n");
 	std::fprintf(stderr, "               microseconds (0 sleeps at once). Default: the built-in window. A measurement knob, not a setting.\n");
+	std::fprintf(stderr, "  --iop-lockstep-skew-holds: with --iop-lockstep-skew N > 0, do not defer EE-started SIF0/SIF1 pumps: hold, as a Threaded hold\n");
+	std::fprintf(stderr, "               does. The IOP is run up to the EE's cycle (items due on the way applied), the pump runs at once, and the skew then\n");
+	std::fprintf(stderr, "               re-grows as the EE runs on. A test knob. Does nothing with a skew of 0.\n");
+	std::fprintf(stderr, "  --iop-lockstep-skew-holds-sif0 / --iop-lockstep-skew-holds-sif1: the same for one channel only; the other is deferred.\n");
 	std::fprintf(stderr, "  --iop-stats-every N: in a --liverun, log the Threaded IOP counters per frame every N frames. The IOPSTATS: line\n");
 	std::fprintf(stderr, "               at the end of the run gives the whole-run figures.\n");
 	std::fprintf(stderr, "  --set Section/Key=Value: base-layer settings override, applied after the harness pinning\n");
@@ -1531,6 +1544,32 @@ bool EERunner::ParseCommandLineArgs(int argc, char* argv[], VMBootParameters& pa
 				IopThread::SetThreadedMinSlice(v.value());
 				continue;
 			}
+			else if (CHECK_ARG_PARAM("--iop-lockstep-skew"))
+			{
+				const auto v = StringUtil::FromChars<s64>(argv[++i]);
+				if (!v.has_value() || v.value() < 0 || v.value() > IopThread::kMaxLag)
+				{
+					Console.Error(fmt::format("--iop-lockstep-skew expects a number of EE cycles, 0 to {}.", IopThread::kMaxLag));
+					return false;
+				}
+				IopThread::SetLockstepSkew(v.value());
+				continue;
+			}
+			else if (CHECK_ARG("--iop-lockstep-skew-holds"))
+			{
+				IopThread::SetLockstepSkewHolds(true);
+				continue;
+			}
+			else if (CHECK_ARG("--iop-lockstep-skew-holds-sif0"))
+			{
+				IopThread::SetLockstepSkewHoldChannels(1);
+				continue;
+			}
+			else if (CHECK_ARG("--iop-lockstep-skew-holds-sif1"))
+			{
+				IopThread::SetLockstepSkewHoldChannels(2);
+				continue;
+			}
 			else if (CHECK_ARG_PARAM("--iop-idle-spin-us"))
 			{
 				const auto v = StringUtil::FromChars<u32>(argv[++i]);
@@ -1540,6 +1579,16 @@ bool EERunner::ParseCommandLineArgs(int argc, char* argv[], VMBootParameters& pa
 					return false;
 				}
 				IopThread::SetThreadedIdleSpinNs(v.value() * 1000u);
+				continue;
+			}
+			else if (CHECK_ARG("--frame-limiter"))
+			{
+				s_frame_limiter = true;
+				continue;
+			}
+			else if (CHECK_ARG("--iop-late-trace"))
+			{
+				IopThread::SetReplyTrace(true);
 				continue;
 			}
 			else if (CHECK_ARG_PARAM("--iop-spin-hint"))
@@ -1976,7 +2025,7 @@ void EERunner::SettingsOverride()
 	s_settings_interface.SetIntValue("EmuCore/GS", "FramesToSkip", 0);
 
 	// Don't limit speed (also set on the VM via SetLimiterMode after init).
-	s_settings_interface.SetBoolValue("EmuCore/GS", "FrameLimitEnable", false);
+	s_settings_interface.SetBoolValue("EmuCore/GS", "FrameLimitEnable", s_frame_limiter);
 	s_settings_interface.SetIntValue("EmuCore/GS", "VsyncEnable", 0);
 
 	// Disable input sources; we drive nothing.
@@ -5737,7 +5786,7 @@ static void CPUThreadMain(VMBootParameters* params, std::atomic<int>* ret)
 		{
 			// Run unlimited — the runner steps frame-by-frame and needs no
 			// wall-clock pacing.
-			VMManager::SetLimiterMode(LimiterModeType::Unlimited);
+			VMManager::SetLimiterMode(s_frame_limiter ? LimiterModeType::Nominal : LimiterModeType::Unlimited);
 			VMManager::SetState(VMState::Paused);
 
 			int code = EXIT_FAILURE;
@@ -5813,6 +5862,22 @@ static void CPUThreadMain(VMBootParameters* params, std::atomic<int>* ret)
 				Console.WriteLn(fmt::format("IOPTHREAD: mode={} handoffs={} parks={} wakes_sent={} slices={} items={} violations={} holds={}",
 					mode_names[static_cast<int>(IopThread::GetMode())], st.handoffs, st.parks, st.wakes_sent, st.slices,
 					st.items_applied, IopThread::ViolationCount(), st.hold_requests + st.hold_markers));
+				// How many of the EE's event tests were reached by a fast-forward (the guest idle), by kind.
+				if (IopThread::GetMode() != IopThreadMode::Off)
+					Console.WriteLn(fmt::format("IOPFF: ee_event_tests={} ff_wait_loop={} ff_timeout_loop={} ff_interpreter={}", st.ee_event_tests, st.ee_ff_wait_loop,
+						st.ee_ff_timeout_loop, st.ee_ff_interpreter));
+				// How late the EE took what the IOP produced (the SBUS interrupt, the SIF pumps the IOP started), and whether the EE was idle across it.
+				if (IopThread::GetMode() != IopThreadMode::Off)
+				{
+					for (const std::string& line : IopThread::FormatReplyStats(IopThread::g_thread.Replies().Stats()))
+						Console.WriteLn(line);
+					for (const std::string& line : IopThread::FormatReplyTrace(IopThread::g_thread.Replies().Trace()))
+						Console.WriteLn(line);
+				}
+				// Lockstep skew: EE-to-IOP items that did not fit the ring and went to the spill queue.
+				Console.WriteLn(fmt::format("E2ISPILL: items={} max_depth={}", IopThread::g_thread.E2ISpillTotal(), IopThread::g_thread.E2ISpillMax()));
+				if (IopThread::LockstepSkewHolds() && IopThread::g_thread.LockstepSkew() > 0)
+					Console.WriteLn(fmt::format("SKEWHOLDS: catchups={} catchup_cycles={}", IopThread::g_thread.LockstepCatchUps(), IopThread::g_thread.LockstepCatchUpCycles()));
 				if (s_mode == RunMode::LiveRun && s_stress)
 				{
 					Console.WriteLn(fmt::format("STRESS-SUMMARY: seed={} iop_thread_switches={} lag_changes={} saves={} loads={} (failed {}) pauses={} resets={} hotkeys={}",
@@ -5837,11 +5902,12 @@ static void CPUThreadMain(VMBootParameters* params, std::atomic<int>* ret)
 						"IOPSTATS-RAW: lag_spins={} lag_spin_iterations={} lag_stall_ns={} lag_spins_parked={} lag_parked_stall_ns={} emu_hold_requests={} emu_hold_stall_ns={} "
 						"hold_requests={} hold_markers={} sif_ee_pumps={} calls_posted={} calls_served={} i2e_drained={} slices={} items_applied={} parks={} wakes_sent={} wakes_dropped={} "
 						"holds_entered={} kicks_applied={} i2e_full_waits={} e2i_full_spins={} hold_sleeps={} lag_spins_idle={} lag_idle_stall_ns={} idle_waits={} idle_ns={} "
-						"sleep_barrier_membarrier={}",
+						"sleep_barrier_membarrier={} sif_deferred={} sif_deferred_applied={} near_waits={} near_wait_iterations={} near_wait_ns={}",
 						st.lag_spins, st.lag_spin_iterations, st.lag_stall_ns, st.lag_spins_parked, st.lag_parked_stall_ns, st.emu_hold_requests, st.emu_hold_stall_ns,
 						st.hold_requests, st.hold_markers, st.sif_ee_pumps, st.calls_posted, st.calls_served, st.i2e_drained, st.slices, st.items_applied, st.parks, st.wakes_sent,
 						st.wakes_dropped, st.holds_entered, st.kicks_applied, st.i2e_full_waits, st.e2i_full_spins, st.hold_sleeps, st.lag_spins_idle, st.lag_idle_stall_ns,
-						st.idle_waits, st.idle_ns, st.sleep_barrier_membarrier));
+						st.idle_waits, st.idle_ns, st.sleep_barrier_membarrier, st.sif_deferred, st.sif_deferred_applied, st.near_waits, st.near_wait_iterations,
+						st.near_wait_ns));
 #ifdef __linux__
 					u64 iop_vol = 0, iop_invol = 0, ee_vol = 0, ee_invol = 0;
 					const bool have_iop = ReadContextSwitches("IOP", &iop_vol, &iop_invol);

@@ -13,9 +13,12 @@ add_pcsx2_test(core_test
 	autotune_trace_tests.cpp
 	iop_fingerprint_tests.cpp
 	iop_thread_mode_tests.cpp
+	iop_thread_gamedb_tests.cpp
 	iop_thread_placement_tests.cpp
 	iop_thread_metrics_tests.cpp
 	iop_thread_channels_tests.cpp
+	iop_lag_control_tests.cpp
+	iop_lag_rules_tests.cpp
 	iop_thread_tests.cpp
 	iop_thread_lockstep_tests.cpp
 	iop_thread_queue_tests.cpp
@@ -29,12 +32,14 @@ add_pcsx2_test(core_test
 	pad_input_tests.cpp
 	trigger_rest_deadzone_tests.cpp
 	shared_word_tests.cpp
+	audio_stream_tests.cpp
 	IopThreadTestSupport.h
 	StubHostTasks.h
 	sif_pump_tests.cpp
 	sbus_tests.cpp
 	savestate_legacy_tests.cpp
 	settings_precedence_tests.cpp
+	settings_migration_tests.cpp
 	gsrunner_affinity_tests.cpp
 	headless_shot_tests.cpp
 	onscreen_keyboard_tests.cpp
@@ -46,6 +51,10 @@ add_pcsx2_test(core_test
 	MockMemoryInterface.h
 	StubHost.cpp
 )
+
+# The game database tests parse the real GameIndex.yaml and the mobile overlay from the source tree.
+set_source_files_properties(iop_thread_gamedb_tests.cpp PROPERTIES COMPILE_DEFINITIONS
+	"ARMSX2_GAMEINDEX_YAML=\"${CMAKE_SOURCE_DIR}/bin/resources/GameIndex.yaml\";ARMSX2_GAMEDB_OVERLAY_YAML=\"${CMAKE_SOURCE_DIR}/bin/resources-overlay/armsx2_overrides.yaml\"")
 
 # gsrunner_affinity_tests.cpp includes the runner's own -affinity parse header; the flag
 # decides which cores a measurement round runs on, so it is worth a test even though the
@@ -83,6 +92,9 @@ add_subdirectory(catalog)
 
 # Namco arcade cabinet controls and library entries.
 add_subdirectory(arcade)
+
+# SPU2 mixer against a frozen copy of itself.
+add_subdirectory(spu2)
 
 
 set(multi_isa_sources

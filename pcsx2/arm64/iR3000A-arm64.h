@@ -12,6 +12,25 @@
 // Use armPsxRegMem() to construct psxRegs-relative MemOperands cheaply.
 #define RPSXSTATE vixl::aarch64::x21
 
+// The IOP clocks while compiled code runs, in two callee-saved registers (the IOP
+// rec saves them in its stack frame, see iopBeginStackFrame, and uses neither for
+// anything else):
+//
+//   RIOPCYC (x19) = psxRegs.cycle - psxRegs.iopNextEventCycle, signed 64-bit.
+//                   A block end adds the block's cycles; the event test is due
+//                   when it is >= 0 (cycle >= iopNextEventCycle).
+//   RIOPEE  (w20) = psxRegs.iopCycleEE, the EE-cycle budget of the slice left.
+//
+// Memory is not updated at a block end. It is made current (spill) before
+// anything that can read or write those fields -- every C call that reaches an
+// IOP device or the event machinery -- and the registers are taken back from
+// memory (reload) after it, since the callee may have moved iopNextEventCycle
+// or ended the slice by zeroing iopCycleEE. The slice exit spills too. The
+// values C code sees during a block are the ones it always saw: those of the
+// start of the block. See iopSpillStub / iopReloadStub.
+#define RIOPCYC vixl::aarch64::x19
+#define RIOPEE vixl::aarch64::w20
+
 // Build a MemOperand addressing a psxRegs field via RPSXSTATE.
 // Mirrors the EE armCpuRegMem pattern. ARM64 LDR with imm12 covers offsets up
 // to 32760 bytes (64-bit) — easily larger than psxRegs, so a single instruction
@@ -76,6 +95,53 @@ void iopStoreClearHit(u32 addr);
 // dispatchers): index 0/1/2 = 8/16/32-bit. w0 = address, w1 = value; sites
 // call them with a single BL so the fast path adds no per-site icache cost.
 extern const void* g_iopStoreStub[3];
+
+// Make memory current from RIOPCYC/RIOPEE (spill) and take the registers back
+// from memory (reload). Called with BL from compiled code and from the other
+// stubs; spill clobbers x9, reload x9 and x10, neither touches anything else
+// (a C call's result in x0 survives a reload).
+extern const void* g_iopSpillStub;
+extern const void* g_iopReloadStub;
+
+// Spill, iopEventTest(), reload. For the cold side of a block end. Preserves nothing
+// but the callee-saved registers: the allocator is empty at a block end.
+extern const void* g_iopEventStub;
+
+// Kinds of guest load, indexing g_iopLoadColdStub.
+enum class IopLoadKind : int
+{
+	LB = 0,
+	LBU = 1,
+	LH = 2,
+	LHU = 3,
+	LW = 4,
+};
+
+// Slow path of the inline RAM-load fast path, one per IopLoadKind, JIT-emitted
+// per reset with the dispatchers: w8 = address in, extended value in w9 out,
+// every allocator register preserved (see _DynGen_LoadColdStub).
+extern const void* g_iopLoadColdStub[5];
+
+// Emit "dst = load(kind) from base + imm" with a RAM fast path inline and a
+// cold site (emitted by psxEmitLoadColdSites at the end of the block) for any
+// other address. Does not flush or free any allocator register: dst and base
+// are host registers the caller allocated (base is read before dst is
+// written, so they may be the same register); everything else in the
+// allocator is untouched across the load. Clobbers w8, w9 and x17.
+void psxEmitRamLoad(IopLoadKind kind, const vixl::aarch64::Register& dst, const vixl::aarch64::Register& base, s32 imm);
+
+// The same for an address known at compile time: a RAM address is one
+// instruction pair, anything else a call of the cold stub in line.
+void psxEmitConstLoad(IopLoadKind kind, const vixl::aarch64::Register& dst, u32 addr);
+
+// Emit the cold sites queued for the block being compiled (the slow paths of its
+// loads and the event-test calls of its block ends). Called once, after the
+// block's last instruction.
+void psxEmitColdSites();
+
+// Emit a spill / a reload at a compile-time C-call seam (see RIOPCYC).
+void psxEmitSpill();
+void psxEmitReload();
 
 void _psxFlushConstReg(int reg);
 void _psxFlushConstRegs();

@@ -417,7 +417,7 @@ Pcsx2Config::SpeedhackOptions& Pcsx2Config::SpeedhackOptions::DisableAll()
 	bitset = 0;
 	EECycleRate = 0;
 	EECycleSkip = 0;
-	iopThreadLag = IopThread::kDefaultLag;
+	iopThreadLag = IopThread::kDefaultSettingLag;
 
 	return *this;
 }
@@ -436,6 +436,7 @@ void Pcsx2Config::SpeedhackOptions::LoadSave(SettingsWrapper& wrap)
 	SettingsWrapBitBool(vu1Instant);
 	SettingsWrapBitBool(iopThread);
 	SettingsWrapBitBool(iopThreadLockstep);
+	SettingsWrapBitBool(iopThreadDeferSif);
 	SettingsWrapEntry(iopThreadLag);
 	SettingsWrapBitBool(DynamicEECycleRate);
 	SettingsWrapEntry(DynamicEECycleRateTrace);
