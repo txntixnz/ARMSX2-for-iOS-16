@@ -8,6 +8,7 @@
 #include "common/Error.h"
 #include "common/HostSys.h"
 
+#include <atomic>
 #include <cstdio>
 #include <csignal>
 #include <cerrno>
@@ -367,6 +368,7 @@ namespace PageFaultHandler
 	static std::recursive_mutex s_exception_handler_mutex;
 	static bool s_in_exception_handler = false;
 	static bool s_installed = false;
+	static std::atomic<UnhandledFaultReporter> s_unhandled_fault_reporter{nullptr};
 } // namespace PageFaultHandler
 
 #ifdef ARCH_ARM64
@@ -458,8 +460,17 @@ void PageFaultHandler::SignalHandler(int sig, siginfo_t* info, void* ctx)
 	if (result == HandlerResult::ContinueExecution)
 		return;
 
-	// We couldn't handle it. Pass it off to the crash dumper.
+	// We couldn't handle it. Say what we can about it, then pass it off to the
+	// crash dumper, which hands the signal back to whoever had it before us:
+	// returning from here retries the instruction, and it faults under them.
+	if (const UnhandledFaultReporter reporter = s_unhandled_fault_reporter.load(std::memory_order_acquire))
+		reporter(sig, info, ctx);
 	CrashHandler::CrashSignalHandler(sig, info, ctx);
+}
+
+void PageFaultHandler::SetUnhandledFaultReporter(UnhandledFaultReporter reporter)
+{
+	s_unhandled_fault_reporter.store(reporter, std::memory_order_release);
 }
 
 bool PageFaultHandler::Install(Error* error)
@@ -478,19 +489,24 @@ bool PageFaultHandler::Install(Error* error)
 	sa.sa_flags = SA_SIGINFO | SA_NODEFER;
 	sa.sa_sigaction = SignalHandler;
 
-	if (sigaction(SIGSEGV, &sa, nullptr) != 0)
+	// What we replace is what a crash goes back to (CrashHandler). On Android
+	// that is debuggerd's handler, as ART's sigchain reports it.
+	struct sigaction replaced;
+	if (sigaction(SIGSEGV, &sa, &replaced) != 0)
 	{
 		Error::SetErrno(error, "sigaction() for SIGSEGV failed: ", errno);
 		return false;
 	}
+	CrashHandler::RecordReplacedHandler(SIGSEGV, replaced);
 
 #ifdef ARCH_ARM64
 	// We can get SIGBUS on ARM64.
-	if (sigaction(SIGBUS, &sa, nullptr) != 0)
+	if (sigaction(SIGBUS, &sa, &replaced) != 0)
 	{
 		Error::SetErrno(error, "sigaction() for SIGBUS failed: ", errno);
 		return false;
 	}
+	CrashHandler::RecordReplacedHandler(SIGBUS, replaced);
 #endif
 
 	s_installed = true;

@@ -22,6 +22,7 @@ namespace
 		"gs-back-thread",
 		"download-mode",
 		"blending",
+		"display-scale",
 	};
 	static_assert(std::size(kLeverNames) == static_cast<size_t>(AutoTuneLever::Count));
 
@@ -35,24 +36,35 @@ namespace
 	};
 	static_assert(std::size(kBottleneckNames) == static_cast<size_t>(AutoTuneBottleneck::Count));
 
+	// The download modes a trial steps through, from the one that gives up the least to the one that gives up the
+	// most. See AutoTuneController::TargetFor for how the current mode picks its place on it.
+	constexpr int kDownloadLadder[] = {
+		AutoTuneDownloadMode::Asynchronous,
+		AutoTuneDownloadMode::NoReadbacks,
+		AutoTuneDownloadMode::Disabled,
+	};
+
 	// The order a bottleneck's levers are tried in. Every lever is tried at most once per value, so a lever
 	// that is not applicable (already on, forbidden, forced by the game database) is skipped.
 	constexpr AutoTuneLever kEeOrder[] = {AutoTuneLever::IopThread, AutoTuneLever::EeGovernor};
 	// The GS threads are the cause and the GPU is not: the back thread splits the CPU work, so it goes first.
 	constexpr AutoTuneLever kGsCpuOrder[] = {AutoTuneLever::GsBackThread, AutoTuneLever::Resolution,
 		AutoTuneLever::DownloadMode, AutoTuneLever::Blending};
-	// The GPU is the cause: resolution moves the GPU's work most. Then the download mode, ahead of the back
-	// thread: a stall on readbacks reads as the GPU (the EE blocked on a GS that is not CPU-bound), the mode is
-	// cheap to try (the light settle, no renderer reopen), and the back thread costs two renderer reopens when
-	// it does not help.
-	constexpr AutoTuneLever kGpuOrder[] = {AutoTuneLever::Resolution, AutoTuneLever::DownloadMode,
-		AutoTuneLever::GsBackThread, AutoTuneLever::Blending};
+	// The GPU is the cause. The display scale goes first: it only takes the output surface down to the size the
+	// game is rendered at, so the picture loses nothing the render had, and the GPU stops scaling it up to the
+	// screen. It is offered only where the output is bigger than the render. Then the resolution, which moves the
+	// GPU's work most. Then the download mode, ahead of the back thread: a stall on readbacks reads as the GPU
+	// (the EE blocked on a GS that is not CPU-bound), the mode is cheap to try (the light settle, no renderer
+	// reopen), and the back thread costs two renderer reopens when it does not help.
+	constexpr AutoTuneLever kGpuOrder[] = {AutoTuneLever::DisplayScale, AutoTuneLever::Resolution,
+		AutoTuneLever::DownloadMode, AutoTuneLever::GsBackThread, AutoTuneLever::Blending};
 	// The same two when the game is so far under full speed that a notch of resolution cannot close the gap
-	// (AutoTunePolicy::cheap_levers_first_below_pct): blending and the download mode go before resolution.
+	// (AutoTunePolicy::cheap_levers_first_below_pct): blending and the download mode go before resolution. The
+	// display scale is still first: it costs no picture quality, so there is nothing to weigh it against.
 	constexpr AutoTuneLever kGsCpuFarOrder[] = {AutoTuneLever::GsBackThread, AutoTuneLever::Blending,
 		AutoTuneLever::DownloadMode, AutoTuneLever::Resolution};
-	constexpr AutoTuneLever kGpuFarOrder[] = {AutoTuneLever::Blending, AutoTuneLever::DownloadMode,
-		AutoTuneLever::Resolution, AutoTuneLever::GsBackThread};
+	constexpr AutoTuneLever kGpuFarOrder[] = {AutoTuneLever::DisplayScale, AutoTuneLever::Blending,
+		AutoTuneLever::DownloadMode, AutoTuneLever::Resolution, AutoTuneLever::GsBackThread};
 
 	double Mean(double sum, size_t n)
 	{
@@ -313,15 +325,64 @@ std::optional<double> AutoTuneController::TargetFor(AutoTuneLever lever, const A
 			return std::nullopt;
 
 		case AutoTuneLever::DownloadMode:
+		{
 			if (!s.hw_renderer || s.download_mode_forced)
 				return std::nullopt;
-			// Only a mode that reads back has anything to give up. Accurate and Force Full both read back
-			// and wait for it; Asynchronous reads back without making the EE wait; No Readbacks stops.
-			if (s.download_mode == AutoTuneDownloadMode::Accurate || s.download_mode == AutoTuneDownloadMode::AccurateForceFull)
-				return static_cast<double>(AutoTuneDownloadMode::Asynchronous);
-			if (s.download_mode == AutoTuneDownloadMode::Asynchronous)
-				return static_cast<double>(AutoTuneDownloadMode::NoReadbacks);
+
+			// The first rung of kDownloadLadder the current mode has not reached yet.
+			// Accurate and Force Full both read back and make the EE wait for it, so every rung is ahead of them;
+			// Asynchronous reads back without the wait, No Readbacks stops reading back, Disabled also stops the EE
+			// waiting on the GS thread. Unsynchronized is not on the ladder: it is a deliberate choice, and not a
+			// deterministic one, so it is left where the player put it.
+			size_t next;
+			switch (s.download_mode)
+			{
+				case AutoTuneDownloadMode::Accurate:
+				case AutoTuneDownloadMode::AccurateForceFull:
+					next = 0;
+					break;
+				case AutoTuneDownloadMode::Asynchronous:
+					next = 1;
+					break;
+				case AutoTuneDownloadMode::NoReadbacks:
+					next = 2;
+					break;
+				default:
+					return std::nullopt;
+			}
+
+			// A rung that was tried and did not help is stepped over, not the end of the ladder: Asynchronous not
+			// paying says nothing about the modes that stop reading back altogether.
+			for (; next < std::size(kDownloadLadder); next++)
+			{
+				const double mode = static_cast<double>(kDownloadLadder[next]);
+				if (!IsRejected(lever, mode, s))
+					return mode;
+			}
 			return std::nullopt;
+		}
+
+		case AutoTuneLever::DisplayScale:
+		{
+			if (!s.hw_renderer || !s.display_scale_available || s.display_base_short_side <= 0)
+				return std::nullopt;
+
+			// The smallest hw scaler step whose surface still holds the render: the render's short side is 448
+			// lines times the multiplier, and the setting counts in whole multiples of 448. A render bigger than
+			// the largest step is left to the resolution lever: shrinking the surface under it would throw away
+			// detail the render has.
+			const int step = static_cast<int>(std::ceil(s.resolution - kValueEpsilon));
+			if (step < 1 || step > kAutoTuneMaxDisplayScale)
+				return std::nullopt;
+
+			// Only a step that makes the surface smaller is a step. "Screen" is the base size; a step in force
+			// holds the short side to its multiple of 448, unless the screen is smaller than that.
+			const double base = s.display_base_short_side;
+			const double now = s.display_scale > 0 ? std::min(base, kAutoTuneBaseHeight * s.display_scale) : base;
+			if (kAutoTuneBaseHeight * step >= now - kValueEpsilon)
+				return std::nullopt;
+			return static_cast<double>(step);
+		}
 
 		case AutoTuneLever::Blending:
 		{
@@ -583,6 +644,7 @@ bool AutoTuneController::SceneChangedDuringTrial(double noise) const
 			return moved(m_trial.gs_before, m_trial.gs_ms) || moved(m_trial.gpu_before, m_trial.gpu_ms);
 		case AutoTuneLever::Resolution:
 		case AutoTuneLever::Blending:
+		case AutoTuneLever::DisplayScale:
 			return moved(m_trial.ee_before, m_trial.ee_ms);
 		case AutoTuneLever::GsBackThread:
 		case AutoTuneLever::DownloadMode:
