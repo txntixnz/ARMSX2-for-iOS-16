@@ -324,6 +324,17 @@ public class NativeApp {
 	/** Why the last runVMThread could not boot, or "" when it did. */
 	public static native String getLastBootError();
 
+	/** The core's VMBootResult for the last runVMThread that could not boot, BOOT_RESULT_SUCCESS when it did. */
+	public static native int getLastBootResult();
+
+	// VMBootResult values (pcsx2/VMManager.h); native-lib.cpp asserts they match.
+	public static final int BOOT_RESULT_SUCCESS = 0;
+	public static final int BOOT_RESULT_FAILURE = 1;
+	/** No BIOS is set up, or the one that was is gone, and the BIOS folder has no other. */
+	public static final int BOOT_RESULT_BIOS_NOT_FOUND = 3;
+	/** The BIOS file is there but could not be read, or is not a PS2 BIOS. */
+	public static final int BOOT_RESULT_BIOS_NOT_USABLE = 4;
+
 	/** The cabinet controls (ARCADE_MODE_*) the core gives a game ID such as NM00004. */
 	public static native int arcadeModeForGameId(String gameId);
 
@@ -1160,6 +1171,8 @@ public class NativeApp {
 	 * Returns null if the file isn't a valid BIOS image.
 	 */
 	public static native BiosInfo getBiosInfoFromFd(int fd);
+	/** Whether the file is a PS1 BIOS. Takes ownership of fd, like getBiosInfoFromFd. */
+	public static native boolean isPs1BiosFromFd(int fd);
 
 	/**
 	 * Read enough of a PS2 disc image to extract its serial (e.g.

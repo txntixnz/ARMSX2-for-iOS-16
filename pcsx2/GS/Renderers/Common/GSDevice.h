@@ -1615,6 +1615,7 @@ public:
 		bool native_counter_draws : 1; ///< Can draw a fresh convert-and-resolve colclip draw at native resolution (GSHWDrawConfig::colclip_native_scale).
 		bool destination_alpha_loop : 1; ///< Copy road for self-reads, except a destination-alpha draw in the stencil-one mode, which reads the target in the pass under a declared feedback loop with one barrier instead of building its stencil in a setup pass. Vulkan only (Turnip on the Adreno 613); see GSSelfReadRoadPolicy.h.
 		GSFeedbackCarry feedback_carry; ///< Which draws may keep the open pass's feedback-loop bits. Vulkan only; see GSDrawRoad.h.
+		u8 sub_texel_precision_bits; ///< Fractional bits the sampler keeps of a texel coordinate (Vulkan's subTexelPrecisionBits), so how far it may round one. 0 = not known; read as Vulkan's minimum, 4.
 		FeatureSupport()
 		{
 			memset(this, 0, sizeof(*this));
@@ -1674,6 +1675,9 @@ public:
 
 protected:
 	std::string m_name = "Unknown";
+	/// Why Create() failed, when the backend knows and has not reported it itself. GSopen adds it
+	/// to its "Failed to create render device" report.
+	std::string m_create_error;
 	FeatureSupport m_features;
 	u32 m_max_texture_size = 0;
 	// ★ Unknown, NOT Adreno. Defaulting to a real vendor meant every backend that never calls
@@ -1877,6 +1881,9 @@ public:
 
 	/// Returns a string containing current adapter in use.
 	const std::string& GetName() const { return m_name; }
+
+	/// Why Create() failed, or empty. See m_create_error.
+	const std::string& GetCreateError() const { return m_create_error; }
 
 	GSTexture* GetColorClipTexture() const { return m_colclip_rt; }
 		

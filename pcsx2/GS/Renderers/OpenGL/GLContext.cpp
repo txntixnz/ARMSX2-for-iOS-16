@@ -31,11 +31,31 @@
 
 #include <cstdlib>
 #include <cstring>
+#include <string_view>
+#include <unordered_set>
 
 static bool ShouldPreferESContext()
 {
 	const char* value = std::getenv("PREFER_GLES_CONTEXT");
 	return (value && std::strcmp(value, "1") == 0);
+}
+
+// GLAD assigns only the entry points the new context's version and extensions provide and leaves
+// the rest as they were, so a pointer from an earlier context in the process survives into one
+// that lacks the function. The null tests that pick a fallback (glColorMaski,
+// glDrawElementsBaseVertex) then skip it and the call goes into the old driver. The Android app
+// keeps one process across games, so a native GLES session followed by ANGLE hits this.
+//
+// Cleared after the load rather than before: under libretro the frontend thread presents through
+// these pointers while the GS thread can be creating a context, so the ones the new context
+// provides must not be null even briefly.
+static void ClearGLADFunctionsNotAssigned(const std::unordered_set<std::string_view>& assigned)
+{
+#define GLAD_FUNCTION(name) \
+	if (!assigned.contains(#name)) \
+		glad_##name = nullptr;
+#include "GS/Renderers/OpenGL/GLADFunctions.inl"
+#undef GLAD_FUNCTION
 }
 
 bool GLContext::AllowHeadless = false;
@@ -129,11 +149,20 @@ std::unique_ptr<GLContext> GLContext::Create(const WindowInfo& wi, Error* error)
 
 	// NOTE: Not thread-safe. But this is okay, since we're not going to be creating more than one context at a time.
 	static GLContext* context_being_created;
+	static std::unordered_set<std::string_view>* names_being_assigned;
+	std::unordered_set<std::string_view> assigned;
 	context_being_created = context.get();
+	names_being_assigned = &assigned;
+	const GLADloadfunc load = [](const char* name) {
+		names_being_assigned->insert(name);
+		return reinterpret_cast<GLADapiproc>(context_being_created->GetProcAddress(name));
+	};
 
 	if (!context->IsGLES())
 	{
-		if (!gladLoadGL([](const char* name) { return reinterpret_cast<GLADapiproc>(context_being_created->GetProcAddress(name)); }))
+		const int gl_version = gladLoadGL(load);
+		ClearGLADFunctionsNotAssigned(assigned);
+		if (!gl_version)
 		{
 			Error::SetStringView(error, "Failed to load GL functions for GLAD");
 			return nullptr;
@@ -141,9 +170,39 @@ std::unique_ptr<GLContext> GLContext::Create(const WindowInfo& wi, Error* error)
 	}
 	else
 	{
-		if (!gladLoadGLES2([](const char* name) { return reinterpret_cast<GLADapiproc>(context_being_created->GetProcAddress(name)); }))
+		const int gles_version = gladLoadGLES2(load);
+		ClearGLADFunctionsNotAssigned(assigned);
+		if (!gles_version)
 		{
 			Error::SetStringView(error, "Failed to load GLES functions for GLAD");
+			return nullptr;
+		}
+
+		// The renderer needs ES 3.0 or newer. On an ES 2.0 context GLAD loads none of the 3.x
+		// entry points, so the first call to one (glInvalidateFramebuffer in RenderBlankFrame)
+		// jumps to null. The 2.0 entry in vlist stays: a context is how we find out what the
+		// driver offers. ANGLE on old Vulkan 1.1 drivers is the usual case.
+		if (GLAD_VERSION_MAJOR(gles_version) < 3)
+		{
+			const char* renderer = reinterpret_cast<const char*>(glGetString(GL_RENDERER));
+			const char* version = reinterpret_cast<const char*>(glGetString(GL_VERSION));
+			Console.ErrorFmt("GL: refusing an OpenGL ES {}.{} context. GL_RENDERER: {} GL_VERSION: {}",
+				GLAD_VERSION_MAJOR(gles_version), GLAD_VERSION_MINOR(gles_version), renderer ? renderer : "",
+				version ? version : "");
+			if (renderer && std::strstr(renderer, "ANGLE"))
+			{
+				Error::SetStringFmt(error,
+					"ANGLE on this device offers only OpenGL ES {}.{}, which ARMSX2 cannot use. "
+					"Use the Vulkan renderer with a custom GPU driver instead.",
+					GLAD_VERSION_MAJOR(gles_version), GLAD_VERSION_MINOR(gles_version));
+			}
+			else
+			{
+				Error::SetStringFmt(error,
+					"This GPU driver offers only OpenGL ES {}.{}, which ARMSX2 cannot use: the OpenGL "
+					"renderer needs OpenGL ES 3.0 or newer. Use the Vulkan renderer instead.",
+					GLAD_VERSION_MAJOR(gles_version), GLAD_VERSION_MINOR(gles_version));
+			}
 			return nullptr;
 		}
 	}

@@ -5,6 +5,7 @@
 #include <cstring>
 
 #include "common/ARCADE.h"
+#include "common/Error.h"
 #include "common/FileSystem.h"
 #include "common/Path.h"
 #include "common/StringUtil.h"
@@ -17,6 +18,25 @@
 static constexpr u32 MIN_BIOS_SIZE = 4 * _1mb;
 static constexpr u32 MAX_BIOS_SIZE = 8 * _1mb;
 static constexpr u32 DIRENTRY_SIZE = 16;
+
+// The PS1's own BIOS is exactly 512 KB and has no PS2 ROM directory.
+static constexpr s64 PS1_BIOS_SIZE = 512 * 1024;
+
+// PS2-format ROMs that are not PS2 BIOS images, by EXTINFO stamp. They carry a ROM directory and read as
+// v1.90 (2003-06-23), so they pass LoadBiosVersion and are listed and auto-picked as a BIOS, but the EE
+// leaves them for unmapped memory within seconds. They come from users' files named ps1_rom.bin and
+// ps3_ps1_bios.bin (9 of 279 problem reports); the stamp says 2011-10-12.
+static constexpr const char* NOT_PS2_BIOS_STAMPS[] = {"20111012-094243"};
+
+static bool IsNotPs2BiosStamp(const std::string& serial)
+{
+	for (const char* stamp : NOT_PS2_BIOS_STAMPS)
+	{
+		if (serial == stamp)
+			return true;
+	}
+	return false;
+}
 
 // --------------------------------------------------------------------------------------
 // romdir structure (packing required!)
@@ -78,7 +98,9 @@ void ReadOSDConfigParames()
 	configParams2.language = configParams1.language;
 }
 
-static bool LoadBiosVersion(std::FILE* fp, u32& version, std::string& description, u32& region, std::string& zone, std::string& serial)
+// [not_ps2], when given, is set when the image is a PS2-format ROM known not to be a PS2 BIOS
+// (NOT_PS2_BIOS_STAMPS); the result is false for it.
+static bool LoadBiosVersion(std::FILE* fp, u32& version, std::string& description, u32& region, std::string& zone, std::string& serial, bool* not_ps2 = nullptr)
 {
 	romdir rd;
 	for (u32 i = 0; i < 512 * 1024; i++)
@@ -133,6 +155,13 @@ static bool LoadBiosVersion(std::FILE* fp, u32& version, std::string& descriptio
 	}
 
 	fileOffset -= ((rd.fileSize + 0x10) & 0xfffffff0) - rd.fileSize;
+
+	if (foundRomVer && IsNotPs2BiosStamp(serial))
+	{
+		if (not_ps2)
+			*not_ps2 = true;
+		return false;
+	}
 
 	if (foundRomVer)
 	{
@@ -416,7 +445,9 @@ std::string FindArcadeBiosFor(const std::string& gameid, const std::string& pick
 	return {};
 }
 
-static std::string FindBiosImage()
+// [ps1_seen], when given, gets the first PS1 BIOS image in the folder that was passed over, for a caller
+// that finds nothing else to say what the folder holds.
+static std::string FindBiosImage(std::string* ps1_seen = nullptr)
 {
 	if (Arcade::IsActive())
 		return FindArcadeBiosImage();
@@ -431,16 +462,20 @@ static std::string FindBiosImage()
 	std::string description, zone;
 	for (const FILESYSTEM_FIND_DATA& fd : results)
 	{
-		if (fd.Size < MIN_BIOS_SIZE || fd.Size > MAX_BIOS_SIZE)
+		const bool in_range = fd.Size >= MIN_BIOS_SIZE && fd.Size <= MAX_BIOS_SIZE;
+		if (!in_range && fd.Size != PS1_BIOS_SIZE)
 			continue;
 
 		// An arcade board's BIOS (COH-H) cannot run a console game: one dumped at 4 MB or more would
 		// otherwise pass for a console BIOS here.
-		if (IsConsoleBIOS(fd.FileName.c_str(), version, description, region, zone))
+		if (in_range && IsConsoleBIOS(fd.FileName.c_str(), version, description, region, zone))
 		{
 			Console.WriteLn("Using BIOS '%s' (%s %s)", fd.FileName.c_str(), description.c_str(), zone.c_str());
 			return std::move(fd.FileName);
 		}
+
+		if (ps1_seen && ps1_seen->empty() && IsPs1BIOS(fd.FileName.c_str()))
+			*ps1_seen = fd.FileName;
 	}
 
 	Console.Error("Unable to auto locate a BIOS image");
@@ -479,6 +514,39 @@ bool IsBIOSFromFd(int fd, u32& version, std::string& description, u32& region, s
 	return ok;
 }
 
+// A PS2 BIOS has a ROM directory; the PS1's BIOS is a 512 KB image without one, and a few PS2-format ROMs
+// are known not to be PS2 BIOS images (NOT_PS2_BIOS_STAMPS). A damaged PS2 BIOS cut to exactly 512 KB reads
+// as a PS1 one, and the message it gets is still a fair one.
+static bool IsPs1BiosImage(std::FILE* fp)
+{
+	u32 version, region;
+	std::string description, zone, serial;
+	bool not_ps2 = false;
+	if (LoadBiosVersion(fp, version, description, region, zone, serial, &not_ps2))
+		return false;
+	return not_ps2 || FileSystem::FSize64(fp) == PS1_BIOS_SIZE;
+}
+
+bool IsPs1BIOS(const char* filename)
+{
+	const auto fp = FileSystem::OpenManagedCFile(filename, "rb");
+	return fp && IsPs1BiosImage(fp.get());
+}
+
+bool IsPs1BIOSFromFd(int fd)
+{
+	if (fd < 0)
+		return false;
+
+	std::FILE* fp = ::fdopen(fd, "rb");
+	if (!fp)
+		return false;
+
+	const bool ps1 = IsPs1BiosImage(fp);
+	std::fclose(fp); // closes underlying fd as well
+	return ps1;
+}
+
 bool IsBIOSAvailable(const std::string& full_path)
 {
 	// We can't use EmuConfig here since it may not be loaded yet.
@@ -500,7 +568,7 @@ bool IsBIOSAvailable(const std::string& full_path)
 // Exceptions:
 //   BadStream - Thrown if the primary bios file (usually .bin) is not found, corrupted, etc.
 //
-bool LoadBIOS()
+BIOSLoadResult LoadBIOS(std::string* path_out)
 {
 	pxAssertMsg(eeMem->ROM, "PS2 system memory has not been initialized yet.");
 
@@ -520,27 +588,59 @@ bool LoadBIOS()
 				EmuConfig.BaseFilenames.Bios.c_str());
 		}
 
-		path = FindBiosImage();
+		std::string ps1_seen;
+		path = FindBiosImage(&ps1_seen);
 		if (path.empty())
-			return false;
+		{
+			if (ps1_seen.empty())
+				return BIOSLoadResult::NotFound;
+
+			if (path_out)
+				*path_out = ps1_seen;
+			return BIOSLoadResult::PS1BIOS;
+		}
 	}
 
-	auto fp = FileSystem::OpenManagedCFile(path.c_str(), "rb");
+	if (path_out)
+		*path_out = path;
+
+	Error error;
+	auto fp = FileSystem::OpenManagedCFile(path.c_str(), "rb", &error);
 	if (!fp)
-		return false;
+	{
+		Console.ErrorFmt("BIOS: cannot open '{}': {}", path, error.GetDescription());
+		return BIOSLoadResult::Unreadable;
+	}
 
 	const s64 filesize = FileSystem::FSize64(fp.get());
 	if (filesize <= 0)
-		return false;
+	{
+		Console.ErrorFmt("BIOS: '{}' is empty", path);
+		return BIOSLoadResult::Unreadable;
+	}
 
-	LoadBiosVersion(fp.get(), BiosVersion, BiosDescription, BiosRegion, BiosZone, BiosSerial);
+	// The BIOS lists a player picks from (Qt, Big Picture, Android, iOS) and the search above only take
+	// files that pass this, so a configured file that fails it was damaged or replaced after it was
+	// picked, and the EE would start executing whatever the file holds.
+	bool not_ps2 = false;
+	if (!LoadBiosVersion(fp.get(), BiosVersion, BiosDescription, BiosRegion, BiosZone, BiosSerial, &not_ps2))
+	{
+		if (not_ps2 || filesize == PS1_BIOS_SIZE)
+		{
+			Console.ErrorFmt("BIOS: '{}' is a PS1 BIOS, which does not run PS2 games", path);
+			return BIOSLoadResult::PS1BIOS;
+		}
+		Console.ErrorFmt("BIOS: '{}' has no PS2 BIOS ROM directory or version", path);
+		return BIOSLoadResult::NotABIOS;
+	}
 
 	BiosRom.resize(Ps2MemSize::Rom);
 
 	if (FileSystem::FSeek64(fp.get(), 0, SEEK_SET) ||
 		std::fread(BiosRom.data(), static_cast<size_t>(std::min<s64>(Ps2MemSize::Rom, filesize)), 1, fp.get()) != 1)
 	{
-		return false;
+		Console.ErrorFmt("BIOS: reading '{}' failed", path);
+		return BIOSLoadResult::Unreadable;
 	}
 
 	// If file is less than 2mb it doesn't have an OSD (Devel consoles)
@@ -558,7 +658,7 @@ bool LoadBIOS()
 
 	LoadExtraRom("rom1", Ps2MemSize::Rom, Ps2MemSize::Rom1);
 	LoadExtraRom("rom2", Ps2MemSize::Rom + Ps2MemSize::Rom1, Ps2MemSize::Rom2);
-	return true;
+	return BIOSLoadResult::Loaded;
 }
 
 void CopyBIOSToMemory()
