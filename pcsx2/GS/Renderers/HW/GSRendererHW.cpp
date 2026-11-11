@@ -54,6 +54,8 @@ GSRendererHW::GSRendererHW()
 	// is the same GPU after a loss, and every setting that changes device features recreates the
 	// renderer as well.
 	m_unsplit_stencil_counter = g_gs_device->Features().fast_stencil_shadow;
+
+	RefreshBurstMemo();
 }
 
 void GSRendererHW::SetTCOffset()
@@ -70,6 +72,7 @@ GSRendererHW::~GSRendererHW()
 
 void GSRendererHW::Destroy()
 {
+	BurstMemoFlushWaiting();
 	g_texture_cache->RemoveAll(true, true, true);
 	GSRenderer::Destroy();
 }
@@ -78,17 +81,20 @@ void GSRendererHW::PurgeTextureCache(bool sources, bool targets, bool hash_cache
 {
 	// Queued draw records reach the TC; retire them before mutating it.
 	DrainBackQueue();
+	BurstMemoFlushWaiting();
 	g_texture_cache->RemoveAll(sources, targets, hash_cache);
 }
 
 void GSRendererHW::ReadbackTextureCache()
 {
 	DrainBackQueue();
+	BurstMemoFlushWaiting();
 	g_texture_cache->ReadbackAll();
 }
 
 GSTexture* GSRendererHW::LookupPaletteSource(u32 CBP, u32 CPSM, u32 CBW, GSVector2i& offset, float* scale, const GSVector2i& size)
 {
+	BurstMemoFlushWaiting();
 	return g_texture_cache->LookupPaletteSource(CBP, CPSM, CBW, offset, scale, size);
 }
 
@@ -107,6 +113,8 @@ void GSRendererHW::Reset(bool hardware_reset)
 	// Read back on CSR Reset, conditional downloading on render swap etc handled elsewhere.
 	if (!hardware_reset)
 		g_texture_cache->ReadbackAll();
+	else
+		g_texture_cache->DropAllHeld(); // local memory is about to be replaced
 
 	m_blend_carry.valid = false;
 	g_texture_cache->RemoveAll(true, true, true);
@@ -114,6 +122,7 @@ void GSRendererHW::Reset(bool hardware_reset)
 	GSHwHack::ResetState();
 
 	GSRenderer::Reset(hardware_reset);
+	RefreshBurstMemo();
 }
 
 void GSRendererHW::UpdateSettings(const Pcsx2Config::GSOptions& old_config)
@@ -128,10 +137,12 @@ void GSRendererHW::UpdateSettings(const Pcsx2Config::GSOptions& old_config)
 	GSRenderer::UpdateSettings(old_config);
 	m_mipmap = GSConfig.HWMipmap;
 	SetTCOffset();
+	RefreshBurstMemo();
 }
 
 void GSRendererHW::VSync(u32 field, bool registers_written, bool idle_frame)
 {
+	BurstMemoEndFrame(idle_frame);
 	m_blend_carry.valid = false;
 
 	if (GSTextureCache::IsHashMemoVerify()) [[unlikely]]
@@ -192,6 +203,7 @@ void GSRendererHW::VSync(u32 field, bool registers_written, bool idle_frame)
 
 GSTexture* GSRendererHW::GetOutput(int i, float& scale, int& y_offset)
 {
+	BurstMemoFlushWaiting();
 	int index = i >= 0 ? i : 1;
 
 	GSPCRTCRegs::PCRTCDisplay& curFramebuffer = PCRTCDisplays.PCRTCDisplays[index];
@@ -238,6 +250,7 @@ GSTexture* GSRendererHW::GetOutput(int i, float& scale, int& y_offset)
 
 GSTexture* GSRendererHW::GetFeedbackOutput(float& scale)
 {
+	BurstMemoFlushWaiting();
 	const int index = m_regs->EXTBUF.FBIN & 1;
 	const GSVector2i fb_size(PCRTCDisplays.GetFramebufferSize(index));
 
@@ -1821,10 +1834,14 @@ GSVector2i GSRendererHW::GetValidSize(const GSTextureCache::Source* tex, const b
 	const GSLocalMemory::psm_t& frame_psm = GSLocalMemory::m_psm[m_cached_ctx.FRAME.PSM];
 	// We can check if the next draw is doing the same from the next page, and assume it's a per line clear.
 	// Battlefield 2 does this.
-	const int pages = ((GSLocalMemory::GetEndBlockAddress(m_cached_ctx.FRAME.Block(), m_cached_ctx.FRAME.FBW, m_cached_ctx.FRAME.PSM, m_r) + 1) - m_cached_ctx.FRAME.Block()) >> 5;
-	if (m_cached_ctx.FRAME.FBW > 1 && m_r.height() == frame_psm.pgs.y && (pages % m_cached_ctx.FRAME.FBW) == 0 && m_env.CTXT[m_backed_up_ctx].FRAME.FBP == (m_cached_ctx.FRAME.FBP + pages) &&
-		!IsPossibleChannelShuffle() && NextDrawMatchesShuffle())
-		height = std::max<int>(m_context->scissor.in.w, height);
+	// The page count is only wanted for a draw exactly one page high, so it is worked out behind that test.
+	if (m_cached_ctx.FRAME.FBW > 1 && m_r.height() == frame_psm.pgs.y)
+	{
+		const int pages = ((GSLocalMemory::GetEndBlockAddress(m_cached_ctx.FRAME.Block(), m_cached_ctx.FRAME.FBW, m_cached_ctx.FRAME.PSM, m_r) + 1) - m_cached_ctx.FRAME.Block()) >> 5;
+		if ((pages % m_cached_ctx.FRAME.FBW) == 0 && m_env.CTXT[m_backed_up_ctx].FRAME.FBP == (m_cached_ctx.FRAME.FBP + pages) &&
+			!IsPossibleChannelShuffle() && NextDrawMatchesShuffle())
+			height = std::max<int>(m_context->scissor.in.w, height);
+	}
 
 	// If the draw is less than a page high, FBW=0 is the same as FBW=1.
 	int width = std::min(std::max<int>(m_cached_ctx.FRAME.FBW, 1) * 64, m_context->scissor.in.z);
@@ -2751,6 +2768,13 @@ void GSRendererHW::HandleManualDeswizzle()
 
 void GSRendererHW::InvalidateVideoMem(const GIFRegBITBLTBUF& BITBLTBUF, const GSVector4i& r)
 {
+	BurstMemoFlushWaiting();
+	// An EE upload or a CPU move is about to write local memory here: held words under it go in first, so
+	// the write lands over them. After the memo's waiting invalidations: those only touch the texture cache
+	// (the skipped draws wrote their bytes already, BurstMemoApply having written any held words under them
+	// first), and the download touches only local memory, so either order leaves the same state; flushing
+	// first keeps the texture cache current for everything after it.
+	g_texture_cache->MaterialiseHeldPages(BITBLTBUF.DBP, BITBLTBUF.DBW, BITBLTBUF.DPSM, r);
 	// printf("HW: [%d] InvalidateVideoMem %d,%d - %d,%d %05x (%d)\n", static_cast<int>(g_perfmon.GetFrame()), r.left, r.top, r.right, r.bottom, static_cast<int>(BITBLTBUF.DBP), static_cast<int>(BITBLTBUF.DPSM));
 
 	// This is gross, but if the EE write loops, we need to split it on the 2048 border.
@@ -2788,10 +2812,16 @@ void GSRendererHW::InvalidateVideoMem(const GIFRegBITBLTBUF& BITBLTBUF, const GS
 
 void GSRendererHW::InvalidateLocalMem(const GIFRegBITBLTBUF& BITBLTBUF, const GSVector4i& r, bool clut)
 {
+	BurstMemoFlushWaiting();
 	// printf("HW: [%d] InvalidateLocalMem %d,%d - %d,%d %05x (%d)\n", static_cast<int>(g_perfmon.GetFrame()), r.left, r.top, r.right, r.bottom, static_cast<int>(BITBLTBUF.SBP), static_cast<int>(BITBLTBUF.SPSM));
 
 	if (clut)
-		return; // FIXME
+	{
+		// The palette is read from local memory on the CPU: held words under it go in first. No target is
+		// read back (FIXME).
+		g_texture_cache->MaterialiseHeldPages(BITBLTBUF.SBP, BITBLTBUF.SBW, BITBLTBUF.SPSM, r);
+		return;
+	}
 
 	auto iter = m_draw_transfers.end();
 	bool skip = false;
@@ -2819,6 +2849,7 @@ void GSRendererHW::InvalidateLocalMem(const GIFRegBITBLTBUF& BITBLTBUF, const GS
 
 void GSRendererHW::Move()
 {
+	BurstMemoFlushWaiting();
 	if (m_mv && m_mv(*this))
 	{
 		// Handled by HW hack.
@@ -2968,6 +2999,8 @@ void GSRendererHW::SwSpriteRender()
 	constexpr bool invalidate_local_mem_before_fb_read = false;
 	if (invalidate_local_mem_before_fb_read && (alpha_blending_enabled || fb_mask_enabled))
 		g_texture_cache->InvalidateLocalMem(dpo, m_r);
+	// Held words under the frame go in before the frame is read or written in part.
+	g_texture_cache->MaterialiseHeldPages(dpo.bp(), dpo.bw(), dpo.psm(), GSVector4i(dx, dy, dx + w, dy + h));
 
 	for (int y = 0; y < h; y++, ++sy, ++dy)
 	{
@@ -3897,7 +3930,11 @@ void GSRendererHW::Draw()
 	// We trigger the sw prim render here super early, to avoid creating superfluous render targets.
 	if (CanUseSwPrimRender(no_rt, no_ds, draw_sprite_tex && m_process_texture))
 	{
-		if (SwPrimRender(*this, true, true))
+		MaterialiseHeldUnderCopy();
+		const bool memo_records = BurstMemoBeforeCopy();
+		const bool copied = SwPrimRender(*this, true, true);
+		BurstMemoAfterCopy(memo_records && copied, copied);
+		if (copied)
 		{
 			GL_CACHE("HW: Possible texture decompression, drawn with SwPrimRender() (BP %x BW %u TBP0 %x TBW %u)",
 				m_cached_ctx.FRAME.Block(), m_cached_ctx.FRAME.FBMSK, m_cached_ctx.TEX0.TBP0, m_cached_ctx.TEX0.TBW);
@@ -3920,7 +3957,9 @@ void GSRendererHW::Draw()
 	bool preserve_depth =
 		not_writing_to_all || (!no_ds && (!all_depth_tests_pass || !m_cached_ctx.DepthWrite() || m_cached_ctx.TEST.ATE));
 
-	const u32 frame_end_bp = GSLocalMemory::GetUnwrappedEndBlockAddress(m_cached_ctx.FRAME.Block(), m_cached_ctx.FRAME.FBW, m_cached_ctx.FRAME.PSM, m_r);
+	// Only read, here and below, behind "a texture is processed and it starts at or after the frame", so only then worked out.
+	const u32 frame_end_bp = (m_process_texture && m_cached_ctx.TEX0.TBP0 >= m_cached_ctx.FRAME.Block()) ?
+		GSLocalMemory::GetUnwrappedEndBlockAddress(m_cached_ctx.FRAME.Block(), m_cached_ctx.FRAME.FBW, m_cached_ctx.FRAME.PSM, m_r) : 0;
 
 	// This is a first pass, but it could be disabled further down.
 	bool tex_is_rt = (m_process_texture && m_cached_ctx.TEX0.TBP0 >= m_cached_ctx.FRAME.Block() &&
@@ -3940,6 +3979,7 @@ void GSRendererHW::Draw()
 		m_mem.m_clut.ClearDrawInvalidity();
 		if (result == CLUTDrawTestResult::CLUTDrawOnCPU && GSConfig.UserHacks_CPUCLUTRender > 0)
 		{
+			MaterialiseHeldUnderCopy();
 			if (SwPrimRender(*this, true, true))
 			{
 				GL_CACHE("HW: Possible clut draw, drawn with SwPrimRender()");
@@ -5536,7 +5576,8 @@ void GSRendererHW::Draw()
 	if (ds)
 		ds->UpdateValidChannels(ZBUF_TEX0.PSM, zm);
 
-	const GSVector2i resolution = PCRTCDisplays.GetResolution();
+	// Every read of the display resolution below sits behind "or the size can be updated", so it is only fetched otherwise.
+	const GSVector2i resolution = can_update_size ? GSVector2i(0, 0) : PCRTCDisplays.GetResolution();
 	GSTextureCache::Target* old_rt = nullptr;
 	GSTextureCache::Target* old_ds = nullptr;
 
@@ -11942,11 +11983,37 @@ GSRendererHW::CLUTDrawTestResult GSRendererHW::PossibleCLUTDrawAggressive()
 	return CLUTDrawTestResult::CLUTDrawOnCPU;
 }
 
+void GSRendererHW::MaterialiseHeldUnderCopy()
+{
+	// The copy road reads and writes local memory on the CPU: the texture at every level it can sample, the
+	// frame over the draw, and the depth buffer when it tests depth. The palette was loaded already, and
+	// its load materialised what it read.
+	if (!g_texture_cache->HasHeldPages())
+		return;
+	if (PRIM->TME)
+	{
+		const GSVector2i levels(0, IsMipMapActive() ? static_cast<int>(m_context->TEX1.MXL) : 0);
+		g_texture_cache->MaterialiseHeldTexture(m_cached_ctx.TEX0, &levels);
+	}
+	g_texture_cache->MaterialiseHeldPages(m_cached_ctx.FRAME.Block(), m_cached_ctx.FRAME.FBW, m_cached_ctx.FRAME.PSM, m_r);
+	if (m_cached_ctx.TEST.ZTE)
+		g_texture_cache->MaterialiseHeldPages(m_cached_ctx.ZBUF.Block(), m_cached_ctx.FRAME.FBW, m_cached_ctx.ZBUF.PSM, m_r);
+}
+
+void GSRendererHW::MaterialiseHeldLocalMemory()
+{
+	g_texture_cache->MaterialiseAllHeld();
+}
+
 bool GSRendererHW::CanUseSwPrimRender(bool no_rt, bool no_ds, bool draw_sprite_tex)
 {
 	// Master enable.
 	const int bw = GSConfig.UserHacks_CPUSpriteRenderBW;
 	const int level = GSConfig.UserHacks_CPUSpriteRenderLevel;
+
+	// For the burst memo: whether a true verdict rests on finding no target at the texture or the frame.
+	m_copy_road_no_targets = false;
+	m_copy_road_frame_checked = false;
 
 	if (bw == 0)
 		return false;
@@ -12049,6 +12116,8 @@ bool GSRendererHW::CanUseSwPrimRender(bool no_rt, bool no_ds, bool draw_sprite_t
 	if (difficult_fbmsk || (PRIM->ABE && m_vt.m_eq.rgba == 0xffff && !m_context->ALPHA.IsOpaque(GetAlphaMinMax().min, GetAlphaMinMax().max)))
 	{
 		GSTextureCache::Target* rt = g_texture_cache->GetTargetWithSharedBits(m_cached_ctx.FRAME.Block(), m_cached_ctx.FRAME.PSM);
+		m_copy_road_frame_checked = true;
+		m_copy_road_no_targets = !rt;
 
 		if (!rt || (!rt->m_dirty.empty() && rt->m_dirty.GetTotalRect(rt->m_TEX0, rt->m_unscaled_size).rintersect(m_r).eq(m_r)))
 			return true;
@@ -12058,6 +12127,7 @@ bool GSRendererHW::CanUseSwPrimRender(bool no_rt, bool no_ds, bool draw_sprite_t
 	}
 
 	// We can use the sw prim render path!
+	m_copy_road_no_targets = true;
 	return true;
 }
 
@@ -12576,6 +12646,20 @@ bool GSRendererHW::TryGSMemClear(bool no_rt, bool preserve_rt, bool invalidate_r
 	return ((invalidate_rt || no_rt) && (invalidate_z || no_ds));
 }
 
+// (old & mask) | fill, for a fill with no bits under the mask: one bit select (BIF) instead of an AND and an ORR, which
+// is a quarter of the clear's 24-bit and masked fill loops. In assembly because the compiler, seeing that the fill has
+// no bits under the mask, turns a BSL intrinsic back into the AND and the ORR.
+static __fi GSVector4i KeepMaskedBits(const GSVector4i& old, const GSVector4i& mask, const GSVector4i& fill)
+{
+#if (defined(__clang__) || defined(__GNUC__)) && defined(__aarch64__)
+	int32x4_t v = old.v4s;
+	__asm__("bif %0.16b, %1.16b, %2.16b" : "+w"(v) : "w"(fill.v4s), "w"(mask.v4s));
+	return GSVector4i(v);
+#else
+	return (old & mask) | fill;
+#endif
+}
+
 void GSRendererHW::ClearGSLocalMemory(const GSOffset& off, const GSVector4i& r, u32 vert_color)
 {
 	GL_INS("HW: ClearGSLocalMemory(): %08X %d,%d => %d,%d @ BP %x BW %u %s", vert_color, r.x, r.y, r.z, r.w, off.bp(),
@@ -12583,6 +12667,11 @@ void GSRendererHW::ClearGSLocalMemory(const GSOffset& off, const GSVector4i& r, 
 
 	const u32 psm = (off.psm() == PSMCT32 && m_cached_ctx.FRAME.FBMSK == 0xFF000000u) ? PSMCT24 : off.psm();
 	const int format = GSLocalMemory::m_psm[psm].fmt;
+
+	// Words a moved depth target holds for local memory there (GSTextureCache::MoveColourPagesIntoDepthTarget)
+	// go in first, unless this clear replaces them all.
+	g_texture_cache->BeforeLocalMemoryWrite(off, r,
+		GSLocalMemory::m_psm[off.psm()].depth || (m_cached_ctx.FRAME.FBMSK & 0x00FFFFFFu) == 0);
 
 	const int left = r.left;
 	const int right = r.right;
@@ -12597,6 +12686,12 @@ void GSRendererHW::ClearGSLocalMemory(const GSOffset& off, const GSVector4i& r, 
 	const u32 fbw = m_cached_ctx.FRAME.FBW;
 	const u32 pages_wide = r.z / 64u;
 	const GSVector2i& pgs = GSLocalMemory::m_psm[psm].pgs;
+
+	// The rows of whole pages the fast path fills, when it fills them with one word (no mask, and not the 24-bit
+	// format, which keeps the alpha byte). Every pixel this clear writes, on either path, gets that same word.
+	u32 filled_first_page = 0, filled_rows = 0, filled_word = 0;
+	bool filled_constant = false;
+
 	if (left == 0 && top == 0 && (right & (pgs.x - 1)) == 0 && pages_wide <= fbw)
 	{
 		const u32 pixels_per_page = pgs.x * pgs.y;
@@ -12608,7 +12703,10 @@ void GSRendererHW::ClearGSLocalMemory(const GSOffset& off, const GSVector4i& r, 
 			const u32 iterations_per_page = (pages_wide * pixels_per_page) / 4;
 			const GSVector4i mask = GSVector4i(drawing_mask);
 			pxAssert((off.bp() & (GS_BLOCKS_PER_PAGE - 1)) == 0);
-			for (u32 current_page = off.bp() >> 5; top < page_aligned_bottom; top += pgs.y, current_page += fbw)
+			filled_constant = !drawing_mask;
+			filled_word = vert_color;
+			filled_first_page = off.bp() >> 5;
+			for (u32 current_page = off.bp() >> 5; top < page_aligned_bottom; top += pgs.y, current_page += fbw, filled_rows++)
 			{
 				current_page &= (GS_MAX_PAGES - 1);
 				m_mem.MarkPageRangeWritten(current_page, pages_wide);
@@ -12616,9 +12714,12 @@ void GSRendererHW::ClearGSLocalMemory(const GSOffset& off, const GSVector4i& r, 
 				GSVector4i* const ptr_end = ptr + iterations_per_page;
 				if (drawing_mask)
 				{
+#if defined(__clang__)
+#pragma clang loop unroll_count(4)
+#endif
 					while (ptr != ptr_end)
 					{
-						*ptr = (*ptr & mask) | vcolor;
+						*ptr = KeepMaskedBits(*ptr, mask, vcolor);
 						ptr++;
 					}
 				}
@@ -12641,9 +12742,12 @@ void GSRendererHW::ClearGSLocalMemory(const GSOffset& off, const GSVector4i& r, 
 				m_mem.MarkPageRangeWritten(current_page, pages_wide);
 				GSVector4i* ptr = reinterpret_cast<GSVector4i*>(m_mem.vm8() + current_page * GS_PAGE_SIZE);
 				GSVector4i* const ptr_end = ptr + iterations_per_page;
+#if defined(__clang__)
+#pragma clang loop unroll_count(4)
+#endif
 				while (ptr != ptr_end)
 				{
-					*ptr = (*ptr & mask) | vcolor;
+					*ptr = KeepMaskedBits(*ptr, mask, vcolor);
 					ptr++;
 				}
 			}
@@ -12658,7 +12762,10 @@ void GSRendererHW::ClearGSLocalMemory(const GSOffset& off, const GSVector4i& r, 
 			const GSVector4i mask = GSVector4i::broadcast16(converted_mask);
 			const u32 iterations_per_page = (pages_wide * pixels_per_page) / 8;
 			pxAssert((off.bp() & (GS_BLOCKS_PER_PAGE - 1)) == 0);
-			for (u32 current_page = off.bp() >> 5; top < page_aligned_bottom; top += pgs.y, current_page += fbw)
+			filled_constant = !converted_mask;
+			filled_word = static_cast<u32>(converted_color) | (static_cast<u32>(converted_color) << 16);
+			filled_first_page = off.bp() >> 5;
+			for (u32 current_page = off.bp() >> 5; top < page_aligned_bottom; top += pgs.y, current_page += fbw, filled_rows++)
 			{
 				current_page &= (GS_MAX_PAGES - 1);
 				m_mem.MarkPageRangeWritten(current_page, pages_wide);
@@ -12729,6 +12836,14 @@ void GSRendererHW::ClearGSLocalMemory(const GSOffset& off, const GSVector4i& r, 
 	// The fast path marked its pages by the page numbers it stepped through, which come from the cached FRAME.FBW
 	// and can differ from off's width after a width change. This marks the rows written pixel by pixel.
 	m_mem.MarkPagesWritten(off, r);
+
+	// Every block of the fast path's pages now holds the filled word, whatever the per-pixel rows wrote (the same
+	// word), so their identities are known without reading them.
+	if (filled_constant && g_texture_cache)
+	{
+		for (u32 row = 0; row < filled_rows; row++)
+			g_texture_cache->NoteBlocksFilled(m_mem, filled_first_page + row * fbw, pages_wide, filled_word);
+	}
 }
 
 bool GSRendererHW::OI_BlitFMV(GSTextureCache::Target* _rt, GSTextureCache::Source* tex, const GSVector4i& r_draw)

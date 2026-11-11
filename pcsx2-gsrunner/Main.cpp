@@ -476,6 +476,7 @@ static u64 s_total_sprite_edge_clamp_draws = 0;
 static double s_last_sw_palette_block_copies = 0;
 static u64 s_total_sw_palette_block_copies = 0;
 static bool s_vm_hash = false;
+static bool s_vm_hash_flush = false;
 static bool s_verify_hash_memo = false;
 static bool s_verify_block_hash = false;
 
@@ -776,6 +777,10 @@ void Host::BeginPresentFrame()
 	// anything reads it), so a change that must leave local memory alone is checked on this too.
 	if (s_vm_hash && g_gs_renderer)
 	{
+		// Every target written back first, so the hash is of local memory as a reader would find it, whichever
+		// targets hold what (a draw may keep words on the GPU that local memory gets only when they are read).
+		if (s_vm_hash_flush)
+			g_gs_renderer->ReadbackTextureCache();
 		const u64 hash = GSXXH3_64bits(g_gs_renderer->m_mem.m_vm8, GSLocalMemory::m_vmsize);
 		Console.WriteLn(fmt::format("GS local memory hash: loop {} frame {} {:016x}", s_loop_number, s_dump_frame_number, hash));
 	}
@@ -1267,6 +1272,7 @@ static void PrintCommandLineHelp(const char* progname)
 						 "packets, so the two arms compare word for word.\n");
 	std::fprintf(stderr, "  -ladder-out <path>: Where to write the ladder rungs. Only used if -ladder is used.\n");
 	std::fprintf(stderr, "  -vmhash: Log a hash of GS local memory at every presented frame.\n");
+	std::fprintf(stderr, "  -vmhash-flush: -vmhash, with every texture cache target read back into local memory first.\n");
 	std::fprintf(stderr, "  -verify-hash-memo: Check the hardware renderer's memo of texture hashes and the write stamps "
 						 "it relies on. Every memo hit also hashes the texture afresh and compares, and at every frame "
 						 "boundary each page of local memory is hashed to find stores that were not marked. Prints one "
@@ -1315,6 +1321,9 @@ static void PrintCommandLineHelp(const char* progname)
 						 "-- only when it is stated changes, and that is byte-identical. Measurement instrument only: "
 						 "on Turnip the create flag puts the driver's serialising primitive mode on every pipeline in "
 						 "a latched pass and costs up to 2.8x (wrc3@1x, SD865: 51.8 ms against 18.5). Vulkan only.\n");
+	std::fprintf(stderr, "  -runs <on|off>: The Vulkan run machine (GSRunsVK.h), on by default where the device has its "
+						 "features. off draws every draw on the classic path: the baseline of the machine's A/Bs and "
+						 "picture checks. Development switch, not a setting.\n");
 	std::fprintf(stderr, "  -no-provoking-vertex: Run as a device without VK_EXT_provoking_vertex, the way Qualcomm's "
 						 "stock Adreno driver does. Pipelines use the first-vertex default, so the provoking-first "
 						 "paths (software flat-shading fixup, expanded-line vertex shader) run on a device that has "
@@ -1793,6 +1802,12 @@ bool GSRunner::ParseCommandLineArgs(int argc, char* argv[], VMBootParameters& pa
 				s_vm_hash = true;
 				continue;
 			}
+			else if (CHECK_ARG("-vmhash-flush"))
+			{
+				s_vm_hash = true;
+				s_vm_hash_flush = true;
+				continue;
+			}
 			else if (CHECK_ARG("-verify-hash-memo"))
 			{
 				s_verify_hash_memo = true;
@@ -2029,6 +2044,17 @@ bool GSRunner::ParseCommandLineArgs(int argc, char* argv[], VMBootParameters& pa
 				// fallback on a device that has the feature, for an A/B on one binary.
 				g_gs_measurement_overrides.no_dual_source = true;
 				Console.WriteLn("Forcing dual-source blending off (Vulkan, as a device without dualSrcBlend)");
+				continue;
+			}
+			else if (CHECK_ARG_PARAM("-runs"))
+			{
+				const char* arg = argv[++i];
+				if (std::strcmp(arg, "on") != 0 && std::strcmp(arg, "off") != 0)
+				{
+					ArgError("-runs: expected on or off.");
+					return false;
+				}
+				g_gs_measurement_overrides.runs_off = std::strcmp(arg, "off") == 0;
 				continue;
 			}
 			else if (CHECK_ARG_PARAM("-vertex-ring-kib"))
