@@ -3612,9 +3612,9 @@ Java_kr_co_iefriends_pcsx2_NativeApp_renderSoftware(JNIEnv *env, jclass clazz) {
 
 // Auto = let GSUtil::GetPreferredRenderer pick at runtime based on what
 // the device supports (Vulkan when available, OpenGL otherwise, SW as
-// last resort). Matches Pcsx2Config::DEFAULT_HW_RENDERER and is the
-// fresh-install default — the in-game overlay's renderer cycle still
-// allows explicit OPENGL/SW override on top.
+// last resort). Matches Pcsx2Config::DEFAULT_HW_RENDERER. The app's own
+// default is Vulkan (Settings.renderer); Auto is what a user picks, and what
+// a new install on a device without Vulkan 1.1 starts on.
 extern "C"
 JNIEXPORT void JNICALL
 Java_kr_co_iefriends_pcsx2_NativeApp_renderAuto(JNIEnv *env, jclass clazz) {
@@ -3969,6 +3969,18 @@ static void PostMaliSX2NoticeIfDue() {
         Host::OSD_WARNING_DURATION);
 }
 
+// The "get a Turnip driver" notice: the hardware renderer is on Qualcomm's own Vulkan driver, the
+// phone's built-in one or a pack of it. Same OSD, duration and timing as the malisx2 notice. Read off
+// the open device, so a Turnip pack that failed to load is warned too: the user is on Qualcomm's
+// driver either way.
+static void PostQualcommNoticeIfDue() {
+    if (!GSDriverReport::ShouldWarnQualcomm(GSIsHardwareRenderer(), GSDriverReport::GetActiveVulkanDriver()))
+        return;
+    Host::AddIconOSDMessage("armsx2_qualcomm_driver_notice", ICON_FA_CIRCLE_EXCLAMATION,
+        "Qualcomm's GPU driver is not supported. Please download a Turnip driver",
+        Host::OSD_WARNING_DURATION);
+}
+
 void Host::OnGameChanged(const std::string& title, const std::string& elf_override, const std::string& disc_path,
                          const std::string& disc_serial, u32 disc_crc, u32 current_crc) {
     const bool game_loaded = current_crc != 0 || !disc_path.empty() || !title.empty();
@@ -3992,8 +4004,10 @@ void Host::OnGameChanged(const std::string& title, const std::string& elf_overri
 
     // The GS device is not open on the first call (disc identified), so the notice is not due yet.
     // It is on the call when the game's own program starts.
-    if (game_loaded)
+    if (game_loaded) {
         PostMaliSX2NoticeIfDue();
+        PostQualcommNoticeIfDue();
+    }
 }
 
 void Host::PumpMessagesOnCPUThread() {
@@ -5373,6 +5387,7 @@ void Host::OnVMStarted()
     // The GS device is open by now. A BIOS-only start has no game program to start, so this is
     // the only point at which that boot can get the notice.
     PostMaliSX2NoticeIfDue();
+    PostQualcommNoticeIfDue();
 }
 
 void Host::OnVMDestroyed()

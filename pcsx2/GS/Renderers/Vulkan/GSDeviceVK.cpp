@@ -969,7 +969,7 @@ bool GSDeviceVK::CreateDevice(VkSurfaceKHR surface, bool enable_validation_layer
 		m_optional_extensions.vk_ext_descriptor_indexing = keep("VK_EXT_descriptor_indexing (run machine features)",
 			m_optional_extensions.vk_ext_descriptor_indexing,
 			probe_di.shaderSampledImageArrayNonUniformIndexing == VK_TRUE && probe_di.runtimeDescriptorArray == VK_TRUE &&
-				probe_di.descriptorBindingVariableDescriptorCount == VK_TRUE && probe_di.descriptorBindingPartiallyBound == VK_TRUE);
+				probe_di.descriptorBindingPartiallyBound == VK_TRUE);
 
 		// Depth ROAA is an optional sub-feature: a driver can offer the extension and colour
 		// access yet not depth.
@@ -1046,7 +1046,6 @@ bool GSDeviceVK::CreateDevice(VkSurfaceKHR surface, bool enable_validation_layer
 	{
 		descriptor_indexing_feature.shaderSampledImageArrayNonUniformIndexing = VK_TRUE;
 		descriptor_indexing_feature.runtimeDescriptorArray = VK_TRUE;
-		descriptor_indexing_feature.descriptorBindingVariableDescriptorCount = VK_TRUE;
 		descriptor_indexing_feature.descriptorBindingPartiallyBound = VK_TRUE;
 		Vulkan::AddPointerToChain(&device_info, &descriptor_indexing_feature);
 	}
@@ -4136,7 +4135,7 @@ void GSDeviceVK::PublishGPUProfile()
 			m_device_properties.deviceName, m_device_driver_properties.driverName,
 			m_device_driver_properties.driverInfo);
 	}
-	GSDriverReport::NoteActiveVulkanDriver(m_device_driver_properties.driverInfo);
+	GSDriverReport::NoteActiveVulkanDriver(static_cast<u32>(m_device_driver_properties.driverID), m_device_driver_properties.driverInfo);
 	DevCon.WriteLn("VK: GPU profile hints: %s", mobile_profile.hints.c_str());
 }
 
