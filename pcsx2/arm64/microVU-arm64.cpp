@@ -456,6 +456,17 @@ void mVUinit(microVU& mVU, uint vuIndex)
 	mVU.cache        = vuIndex ? SysMemory::GetVU1Rec() : SysMemory::GetVU0Rec();
 	mVU.prog.x86end  = (vuIndex ? SysMemory::GetVU1RecEnd() : SysMemory::GetVU0RecEnd()) - (mVUcacheSafeZone * _1mb);
 
+	// Nothing is generated in the region yet; the first mVUreset emits the
+	// dispatchers. Pointers kept from a previous CPU thread session would aim
+	// into code memory that was released and mapped again zero-filled at the
+	// same address (Android ends the session with every game). mVUreset reads
+	// a null startFunct as "this VU has no dispatcher".
+	mVU.startFunct       = nullptr;
+	mVU.startFunctResume = nullptr;
+	mVU.startFunctXG     = nullptr;
+	mVU.resumeEntry      = nullptr;
+	mVU.resumeBlock      = nullptr;
+
 	mVU.regAlloc.reset(new microRegAlloc(mVU.index));
 
 	// Recording follows the config (UseVUProgramCache) and must be set before
@@ -1190,9 +1201,18 @@ void mVUreset(microVU& mVU, bool resetReserve, bool vu1Idle)
 	if (THREAD_VU1 && !vu1Idle)
 	{
 		DevCon.Warning("mVU Reset");
+		// MTVU switched on during gameplay: finish the running VU1 program here.
+		// Only a microVU1 with a dispatcher can be running one. At VM init the
+		// busy bit can be left over from the previous VM (vuMemReset clears it
+		// later, in SysMemory::Reset), and after a CPU thread session ended
+		// microVU1's code memory is zeroes until VU1's own reset, which comes
+		// after VU0's: calling into it was the SIGILL at the region's start.
 		if (VU0.VI[REG_VPU_STAT].UL & 0x100)
 		{
-			CpuVU1->Execute(vu1RunCycles);
+			if (CpuVU1 != &CpuMicroVU1 || microVU1.startFunct)
+				CpuVU1->Execute(vu1RunCycles);
+			else
+				DevCon.Warning("mVU Reset: VU1 marked busy with no microVU1 dispatcher, not run");
 		}
 		VU0.VI[REG_VPU_STAT].UL &= ~0x100;
 	}
@@ -2784,38 +2804,124 @@ bool SaveStateBase::vuJITFreeze()
 //------------------------------------------------------------------
 // Crash post-mortem (RecCrashReport-arm64.h)
 //------------------------------------------------------------------
+// RecCrashReport-arm64.cpp, the post-mortem, is the only caller of this, and it
+// is Linux only -- as is VuBlockScan, the model these readers fill in. So this
+// is Linux only too; the declarations stay for every platform.
+#if defined(__linux__)
 
 uptr RecCrashReport::VuBlocksStart(int vu)
 {
 	return reinterpret_cast<uptr>((vu ? microVU1 : microVU0).prog.x86start);
 }
 
-// Blocks record where their code starts but not where it ends, so the best
-// there is: the entry nearest below the pc among the blocks of the program
-// being run. Reads the program's block lists only, on the thread that builds
-// them.
+// The block running a host pc, from the extent each compile records
+// (microBlock::extent): the innermost block of the program being run whose
+// extent holds the pc; failing that, of any other program of this VU; failing
+// that, the nearest entry below the pc in the program being run. The window
+// comes from the program named. Reads microVU's program and block lists, on
+// the thread that builds them, which was running microVU code and not
+// changing them.
+namespace
+{
+	template <typename F>
+	void ForEachVuBlock(const microProgram& prog, F&& f)
+	{
+		for (u32 i = 0; i < mProgSize / 2; i++)
+		{
+			microBlockManager* const manager = prog.block[i];
+			if (!manager)
+				continue;
+			manager->forEachBlock([&](const microBlock& block) {
+				RecCrashReport::VuBlock b;
+				b.host_start = reinterpret_cast<uptr>(block.x86ptrStart);
+				b.host_size = mVUBlockExtent::HostBytes(block.extent);
+				b.guest_pc = static_cast<u16>(i * 8);
+				b.guest_pairs = static_cast<u16>(mVUBlockExtent::GuestPairs(block.extent));
+				if (b.host_start)
+					f(b);
+			});
+		}
+	}
+
+	// The block's words from the program's copy of micro memory. The copy holds
+	// the program's ranges, [start, end) in bytes; an end of -1 is a range still
+	// open, not copied yet.
+	void CopyProgramCode(const microProgram& prog, RecCrashReport::VuHit* hit)
+	{
+		hit->program_code_mask = 0;
+		if (!prog.ranges)
+			return;
+		for (u32 i = 0; i < RecCrashReport::kMaxCodeWords; i++)
+		{
+			const u32 addr = hit->block.guest_pc + i * 4u;
+			if (addr / 4 >= mProgSize)
+				break;
+			for (const microRange& r : *prog.ranges)
+			{
+				if (r.end >= 0 && static_cast<s64>(addr) >= r.start && static_cast<s64>(addr) + 4 <= r.end)
+				{
+					hit->program_code[i] = prog.data[addr / 4];
+					hit->program_code_mask |= 1u << i;
+					break;
+				}
+			}
+		}
+	}
+
+	void ScanVuProgram(const microProgram& prog, uptr host_pc, RecCrashReport::VuHit* hit)
+	{
+		RecCrashReport::VuBlockScan scan(host_pc);
+		ForEachVuBlock(prog, [&](const RecCrashReport::VuBlock& b) { scan.Add(b); });
+		hit->program = prog.idx;
+		hit->program_start = prog.startPC;
+		hit->found = scan.Best(&hit->block);
+		hit->contains = scan.Contains();
+		scan.FillWindow(hit);
+		if (hit->found)
+			CopyProgramCode(prog, hit);
+	}
+
+	bool VuProgramContains(const microProgram& prog, uptr host_pc)
+	{
+		bool contains = false;
+		ForEachVuBlock(prog, [&](const RecCrashReport::VuBlock& b) {
+			if (b.host_size && host_pc - b.host_start < b.host_size)
+				contains = true;
+		});
+		return contains;
+	}
+} // namespace
+
 void RecCrashReport::FindVuBlock(int vu, uptr host_pc, VuHit* hit)
 {
 	microVU& mVU = vu ? microVU1 : microVU0;
-	const microProgram* const prog = mVU.prog.cur;
-	if (!prog)
-		return;
+	const microProgram* const cur = mVU.prog.cur;
+	if (cur)
+	{
+		hit->current_program = cur->idx;
+		ScanVuProgram(*cur, host_pc, hit);
+		if (hit->contains)
+			return;
+	}
 
-	hit->program = prog->idx;
-	hit->program_start = prog->startPC;
+	// Code of another program: a link into a program that is not the current
+	// one, or a current program that was not updated.
 	for (u32 i = 0; i < mProgSize / 2; i++)
 	{
-		microBlockManager* const manager = prog->block[i];
-		if (!manager)
+		const microProgramList* const list = mVU.prog.prog[i];
+		if (!list)
 			continue;
-		manager->forEachBlock([&](const microBlock& block) {
-			const uptr start = reinterpret_cast<uptr>(block.x86ptrStart);
-			if (start <= host_pc && start > hit->host_start)
+		for (const microProgram* prog : *list)
+		{
+			if (prog && prog != cur && VuProgramContains(*prog, host_pc))
 			{
-				hit->found = true;
-				hit->block_pc = i * 8;
-				hit->host_start = start;
+				*hit = VuHit{};
+				hit->current_program = cur ? cur->idx : -1;
+				ScanVuProgram(*prog, host_pc, hit);
+				return;
 			}
-		});
+		}
 	}
 }
+
+#endif // defined(__linux__)

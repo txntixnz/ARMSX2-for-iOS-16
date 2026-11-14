@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: GPL-3.0+
 
 // What the process writes to the log when it takes a SIGSEGV or SIGBUS that
-// nothing handles (PageFaultHandler gave up on it), before the signal kills
-// it: the signal, the thread, where the host pc is (which recompiler's code,
+// nothing handles (PageFaultHandler gave up on it), or a SIGILL, before the
+// signal kills it: the signal, the thread, where the host pc is (which recompiler's code,
 // and which part of it), the recompiled block it is in, the host registers,
 // and for EE or IOP code the guest registers and the block's guest code.
 // RecErrorReport-arm64.h is the counterpart for errors the recompilers detect
@@ -19,7 +19,8 @@
 //     recompiler sets at reserve and reset;
 //   - the faulting instruction word, inside the code area, which is mapped
 //     readable as a whole;
-//   - the block lists (BASEBLOCKEX arrays, microVU's current program), only
+//   - the loaded-module table ModuleMap keeps, for a pc outside the code area;
+//   - the block lists (BASEBLOCKEX arrays, microVU's programs), only
 //     for a pc in that recompiler's code, so only on the thread that compiles
 //     into them, which was running generated code and not changing them;
 //   - cpuRegs, psxRegs, vuRegs, and guest RAM and ROM through RecErrorReport's
@@ -37,6 +38,7 @@
 //   thread 4242 "CPU Thread", signal 11, si_code 1
 //   pc 0x0000000111d01234: EE recompiler +0x00001234 (blocks), code area +0x00001234, instruction f9400021
 //   block: EE 0x00123450, 12 instructions, host 0x0000000111d01200 +0x00000034 of 0x00000180
+//   lr 0x0000aaaadd71e9cc: not in recompiled code (armsx2-qt+0x64e9cc, build-id <all of it, in hex>)
 //   host registers:
 //       x0 0000000000000000   x1 0000000000000001   x2 0000000000000002   x3 0000000000000003
 //     (8 such lines: x0 to x30, then sp; names right-aligned in 4 columns)
@@ -51,10 +53,26 @@
 //     (up to 16 words; ???????? for a word with no memory behind it)
 // Aborting application.
 //
+// The report is at most 16 KiB (kMaxReportBytes); its parts are bounded well
+// below that. Past the cap, one line reads "  (report cut short here, at its
+// size cap)", the rest is dropped, and "Aborting application." still ends it.
+//
 // The first line names the signal and its si_code ("si_code N" when the code
-// has no name) and gives the fault address. The thread line has the kernel's
+// has no name) and gives the fault address; for SIGILL that is the address of
+// the instruction, the pc, as the kernel reports it (ILL_ILLOPC for an
+// undefined instruction). The thread line has the kernel's
 // thread id and name. The pc line, for a pc outside the code area, ends
-// "not in recompiled code" and has no instruction. Otherwise it gives the
+// "not in recompiled code" and has no instruction; when the pc is in a loaded
+// module it goes on to name it, the pc's ELF address in it (what addr2line
+// and llvm-symbolizer take: the pc minus the module's load bias) and its GNU
+// build id, the hex of the note's bytes, all of them (40 digits for the usual
+// 20-byte id):
+//   pc 0x0000007a1b2c3d40: not in recompiled code (libvulkan_freedreno.so+0x1c3d40, build-id 5f0c3a9e0102030405060708090a0b0c0d0e0f10)
+// or "no build-id" for a module without one. The offset has as many digits as
+// it needs. The module table is refreshed at startup, after each library the
+// emulator loads (DynamicLibrary) and after the Vulkan instance and device are
+// made; a library loaded otherwise since the last refresh is not named.
+// Otherwise the pc line gives the
 // region (EE recompiler, IOP recompiler, VIF0 unpack recompiler, VIF1 unpack
 // recompiler, microVU0, microVU1, VIF unpack functions, GS software renderer)
 // with the pc's offset into it, for a recompiler the part in parentheses
@@ -66,12 +84,57 @@
 // names the block whose host code holds the pc: its guest start address as
 // the recompiler keys it (physical for the EE), its length in instructions,
 // and the pc's offset into its host code; or it reads "block: none found".
-// microVU blocks record no size, so for microVU it names the block entry
-// nearest below the pc in the program being run, and a TPC line follows:
-//   block: VU1 0x0120, nearest entry below the pc in program 3 (start 0x0000), host 0x0000000118d030c0 +0x00000040
+//
+// For microVU, the lines after the pc line are:
+//   block: VU1 0x0120, nearest entry below the pc in program 3 (start 0x0000), host 0x0000000118d030c0 +0x00000040 of 0x00000180
 //   VU1 TPC 0x01a8 as last stored
-// The guest register, guest pc and guest code lines are there only for EE and
-// IOP code; the IOP's registers are 32 bits and its header is "IOP registers:".
+//   VU1 block extent: host 0x0000000118d030c0 +0x00000040 of 0x00000180, guest 0x0120 to 0x0178 (12 pairs), holds the pc
+//   VU1 block map, program 3 (start 0x0000), by host address; > the block named, + another block holding the pc:
+//     (5 lower blocks not shown)
+//   + 0x0000  host 0x0000000118d03000  size 0x00000400, 4 pairs
+//   > 0x0120  host 0x0000000118d030c0  size 0x00000180, 12 pairs
+//     0x0040  host 0x0000000118d03400  size not recorded
+//     (2 higher blocks not shown)
+// and between the extent line and the map, the block's microcode, when a
+// block is named:
+//   VU1 code at the block:
+//     0120  8000033c
+//     0124  000002ff  micro memory now 000002fe
+//     0128  4a0002bc  from micro memory, not in the program's copy
+//     (one word a line, each pair's lower instruction first; the block's
+//     length, at most 16 words, cut at the end of micro memory)
+// A word comes from the program's copy of micro memory, the bytes the program
+// was compiled from, which holds its ranges only. When micro memory has since
+// changed, the line adds what it holds now; a word outside the copy is read
+// from micro memory and says so.
+// Each block records its extent when it is compiled (microBlock::extent): the
+// host bytes its compile produced and its guest instruction pairs. A block's
+// host extent includes the blocks compiled inside its compile (the not-taken
+// path of a branch is compiled in place), so extents nest. The block named is
+// the innermost one holding the pc, in the program being run or failing that
+// in another program of the VU, which the extent line then names; with no
+// block holding the pc it is the entry nearest below the pc in the program
+// being run, and the extent line reads
+//   VU1 block extent: pc is not inside any block of program 3 or of another program of VU1
+// adding "(N blocks of program 3 have no recorded size)" when some have none:
+// blocks placed by vu-aot record none, so they are never said to hold the pc.
+// The block line keeps the wording the triage parser matches; " of 0x..." is
+// there only when the block's size is recorded, and the line is "block: none
+// found" when the program has no block at or below the pc. With no current
+// program, the extent line reads "no current program" and there is no map.
+// The map lists up to 48 blocks of the program named, by host address: the
+// ones nearest the pc, up to 8 of them above it. Guest addresses are byte
+// addresses in micro memory; "to" names the last pair's address.
+// The lr line is x30, the caller's return address, with any pointer-
+// authentication code taken off. It reads like the pc line, without the
+// instruction: the recompiler region and part, or "not in recompiled code"
+// with the module, offset and build id. Its block is not looked up. It comes
+// after the block lines and everything the microVU section adds, just before
+// "host registers:"; a report built without the registers has none (the
+// pinned examples in rec_crash_report_tests.cpp, except the lr test).
+//
+// The guest register, guest pc and guest code lines are there for EE and IOP
+// code only; the IOP's registers are 32 bits and its header is "IOP registers:".
 // The pinned EE registers are read from the host registers, as they are
 // authoritative while EE code runs; the rest come from cpuRegs, as last stored.
 
@@ -79,6 +142,7 @@
 
 #include "arm64/RecErrorReport-arm64.h"
 
+#include "common/ModuleMap.h"
 #include "common/Pcsx2Defs.h"
 
 #include <cstddef>
@@ -130,6 +194,9 @@ namespace RecCrashReport
 	};
 
 	Where Classify(const Layout& layout, uptr pc);
+
+	// A code address with any pointer-authentication code taken off (XPACLRI).
+	uptr StripPointerAuth(uptr address);
 	const char* RegionName(Area area); // "EE recompiler", ...; null for None
 	const char* PartName(Area area); // "blocks", ...; null for a region with one part
 
@@ -151,18 +218,97 @@ namespace RecCrashReport
 		u32 host_size = 0;
 	};
 
-	// The microVU block entry nearest below a host pc, in the current program.
-	struct VuHit
+	// One microVU block: its guest start (a byte address in micro memory), where
+	// its host code starts, and its extent (0 when not recorded).
+	struct VuBlock
 	{
-		bool found = false;
-		int program = -1; // -1: no current program
-		u32 program_start = 0;
-		u32 block_pc = 0;
 		uptr host_start = 0;
-		u32 tpc = 0;
+		u32 host_size = 0;
+		u16 guest_pc = 0;
+		u16 guest_pairs = 0;
 	};
 
+	static constexpr u32 kMaxVuWindow = 48;
+	static constexpr u32 kMaxVuWindowAbove = 8;
 	static constexpr u32 kMaxCodeWords = 16;
+
+	// The microVU block holding a host pc: the innermost block of the program
+	// being run whose extent holds it, else the one of any other program of that
+	// VU, else the entry nearest below the pc in the program being run. And the
+	// blocks around the pc, by host address, from the program named.
+	struct VuHit
+	{
+		bool found = false; // block is set
+		bool contains = false; // and its extent holds the pc
+		int program = -1; // the program block is in; -1: no current program
+		u32 program_start = 0;
+		int current_program = -1; // the program being run
+		VuBlock block;
+		u32 tpc = 0;
+
+		// Up to kMaxVuWindow blocks of `program`, in host address order: the ones
+		// nearest the pc, at most kMaxVuWindowAbove of them above it.
+		VuBlock window[kMaxVuWindow];
+		u32 window_count = 0;
+		u32 blocks_below = 0; // blocks of the program below the window
+		u32 blocks_above = 0; // and above it
+		u32 blocks_unsized = 0; // blocks of the program with no recorded extent
+
+		// The first kMaxCodeWords words of the block named, from the program's
+		// copy of micro memory (what the program was compiled from); bit i of the
+		// mask is set when the copy holds word i (it holds the program's ranges
+		// only).
+		u32 program_code[kMaxCodeWords] = {};
+		u32 program_code_mask = 0;
+	};
+	static_assert(kMaxCodeWords <= 32, "VuHit::program_code_mask has a bit per word");
+
+	// A word of VU microcode at the block: from the program's copy when it holds
+	// it, and as micro memory has it now.
+	struct VuWord
+	{
+		u32 addr = 0; // byte address in micro memory
+		u32 program = 0;
+		u32 live = 0;
+		bool in_program = false;
+		bool live_readable = false;
+	};
+
+	// Picks VuHit's block and window out of a program's blocks, given one at a
+	// time. FindVuBlock's logic, apart from the walk over microVU's lists.
+	class VuBlockScan
+	{
+	public:
+		explicit VuBlockScan(uptr host_pc) : m_pc(host_pc) {}
+		void Add(const VuBlock& block);
+		bool Contains() const { return m_inner_found; }
+		// The innermost block holding the pc, else the nearest entry below it.
+		bool Best(VuBlock* block) const;
+		void FillWindow(VuHit* hit) const;
+
+	private:
+		static bool Holds(const VuBlock& b, uptr pc) { return b.host_size && pc - b.host_start < b.host_size; }
+
+		uptr m_pc;
+		bool m_inner_found = false;
+		VuBlock m_inner;
+		bool m_nearest_found = false;
+		VuBlock m_nearest;
+		u32 m_unsized = 0;
+		// The nearest blocks at or below the pc, highest first, and above it,
+		// lowest first.
+		VuBlock m_below[kMaxVuWindow];
+		u32 m_below_count = 0;
+		u32 m_below_total = 0;
+		VuBlock m_above[kMaxVuWindow];
+		u32 m_above_count = 0;
+		u32 m_above_total = 0;
+	};
+
+	// The cap on the whole report. Its parts are bounded so it stays far below;
+	// past it, lines are dropped, one line says so, and the last line is still
+	// written.
+	static constexpr size_t kMaxReportBytes = 16 * 1024;
 
 	struct Report
 	{
@@ -176,6 +322,14 @@ namespace RecCrashReport
 		Where where;
 		bool have_instruction = false;
 		u32 instruction = 0;
+		bool have_module = false; // a pc outside the code area, in a known module
+		ModuleMap::Hit module;
+
+		bool have_lr = false; // x30, written as the lr line
+		uptr lr = 0; // without a pointer-authentication code
+		Where lr_where;
+		bool lr_have_module = false;
+		ModuleMap::Hit lr_module;
 
 		Cpu block_cpu = Cpu::None; // whose block line to write, if any
 		bool block_found = false;
@@ -194,15 +348,26 @@ namespace RecCrashReport
 		u32 guest_pc = 0;
 		u32 frame = 0;
 
+		// The guest code at the block: EE or IOP instructions.
 		RecErrorReport::Word code[kMaxCodeWords];
 		u32 code_count = 0;
+		// For microVU, the microcode at the block.
+		VuWord vu_code[kMaxCodeWords];
+		u32 vu_code_count = 0;
 	};
 
 	// Receives the report a line at a time, newline included.
 	using Sink = void (*)(void* context, const char* text, size_t length);
 
-	// Writes the report in the format above. Allocates nothing.
-	void Write(const Report& report, Sink sink, void* context);
+	// Writes the report in the format above, at most `limit` bytes of it (the
+	// last line is always written). Allocates nothing.
+	void Write(const Report& report, Sink sink, void* context, size_t limit = kMaxReportBytes);
+
+	// Up to kMaxCodeWords words of microcode from the named block's guest pc:
+	// the block's length (all 16 when it is not recorded), cut at the end of
+	// micro memory. Each from the program's copy in hit.program_code where it
+	// holds the word, and from micro memory (null: none to read).
+	u32 ReadVuCode(const u8* micro, u32 micro_size, const VuHit& hit, VuWord* code);
 
 	// The layout of the live code area and recompilers.
 	Layout CurrentLayout();
@@ -215,7 +380,8 @@ namespace RecCrashReport
 	// time it is called in the process.
 	void OnUnhandledFault(int signal, void* siginfo, void* ucontext);
 
-	// Registers OnUnhandledFault with PageFaultHandler.
+	// Registers OnUnhandledFault with PageFaultHandler, and takes the first
+	// snapshot of the loaded modules (common/ModuleMap.h).
 	void Install();
 
 	// Defined by the recompilers, for Capture and CurrentLayout.
