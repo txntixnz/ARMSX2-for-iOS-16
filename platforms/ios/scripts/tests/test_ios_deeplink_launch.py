@@ -12,8 +12,10 @@ from ios_source import IOS_ROOT, ROOT, swift
 
 HANDLER = swift("ARMSX2DeepLinkHandler.swift")
 GAME_LIST = swift("GameListView.swift")
-APP_STATE = swift("AppState.swift")
+COORDINATOR = ("", "+Alerts", "+Focus", "+Menus", "+ContextMenu", "+Launch")
+SESSION = swift("GameSession.swift")
 ROOT_VIEW = swift("RootView.swift")
+ROOT_LIFECYCLE = swift("RootLifecycleModifier.swift")
 INFO = IOS_ROOT / "Info.plist.in"
 
 LAUNCH_VERBS = ("launch", "boot", "play")
@@ -111,19 +113,22 @@ class DeepLinkLaunch(unittest.TestCase):
                 "games exist" % reader)
 
     def test_the_game_menu_copies_the_handlers_link(self):
-        menu = GAME_LIST.read_text(encoding="utf-8")
+        launch = swift("GameLibraryControllerCoordinator+Launch.swift").read_text(encoding="utf-8")
         self.assertIn(
-            "ARMSX2DeepLinkHandler.launchURL(forISO:", menu,
+            "ARMSX2DeepLinkHandler.launchURL(forISO:", launch,
             "Copy Launch Link no longer asks the handler for the link")
+        library = "".join(
+            swift("GameLibraryControllerCoordinator%s.swift" % part).read_text(encoding="utf-8")
+            for part in COORDINATOR) + GAME_LIST.read_text(encoding="utf-8")
         self.assertNotIn(
-            '"armsx2://', menu,
+            '"armsx2://', library,
             "the game list builds a launch link by hand, which can drift from what the "
             "handler accepts")
 
     def test_a_link_asks_before_replacing_a_running_game(self):
         """Booting under a live VM rewrites its settings and breaks its disc reads, so bootGame
         hands a running game to the Restart VM prompt instead of booting over it."""
-        state = APP_STATE.read_text(encoding="utf-8")
+        state = SESSION.read_text(encoding="utf-8")
         start = state.find("    func bootGame(")
         self.assertGreaterEqual(start, 0, "bootGame disappeared")
         boot = state[start:state.find("\n    }\n", start)]
@@ -145,8 +150,10 @@ class DeepLinkLaunch(unittest.TestCase):
             "FileImportHandler.shared.handleURL(url)", bridge,
             "DeepLinkBridge does not pass URLs that are not armsx2 links to FileImportHandler")
         self.assertNotIn(
-            ".onOpenURL", ROOT_VIEW.read_text(encoding="utf-8"),
-            "RootView has an onOpenURL, which never runs under the UIKit scene lifecycle")
+            ".onOpenURL",
+            ROOT_VIEW.read_text(encoding="utf-8") + ROOT_LIFECYCLE.read_text(encoding="utf-8"),
+            "RootView or its lifecycle modifier has an onOpenURL, which never runs under the UIKit "
+            "scene lifecycle")
 
     def test_the_launch_link_page_names_what_the_handler_accepts(self):
         """Frontend authors read platforms/ios/docs/launch-links.md, not this handler."""

@@ -23,6 +23,7 @@
 #include <dlfcn.h>
 #include <setjmp.h>
 #include <optional>
+#include <string_view>
 #include <sys/mman.h>
 #include <sys/sysctl.h>
 #include <thread>
@@ -40,11 +41,27 @@
 #include <ApplicationServices/ApplicationServices.h>
 #include <IOKit/pwr_mgt/IOPMLib.h>
 #else
-#include <glob.h>
+#include <CoreFoundation/CoreFoundation.h>
+#include <libkern/OSCacheControl.h>
+#include <mach-o/dyld.h>
+#include <sys/syscall.h>
+#include <xpc/xpc.h>
 #endif
 
-#if TARGET_OS_IPHONE
-extern "C" int csops(pid_t pid, unsigned int ops, void* useraddr, size_t usersize);
+#if TARGET_OS_IPHONE && !TARGET_OS_SIMULATOR
+static constexpr u32 CS_KILL_FLAG = 0x00000200u;
+static constexpr u32 CS_DEBUGGED_FLAG = 0x10000000u;
+
+// The raw syscall, not libc csops: Dopamine's systemhook interposes csops and
+// answers from a value it cached at its own check-in.
+static bool ReadCsFlags(u32* flags)
+{
+	*flags = 0;
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+	return syscall(SYS_csops, getpid(), 0, flags, sizeof(*flags)) == 0;
+#pragma clang diagnostic pop
+}
 #endif
 
 // Darwin (OSX) is a bit different from Linux when requesting properties of
@@ -662,16 +679,132 @@ static const char* JitModeName(DarwinMisc::JitMode mode)
 }
 
 #if TARGET_OS_IPHONE && !TARGET_OS_SIMULATOR
-static bool HasTXM()
+// 1 or 0 from the device tree, -1 when it can't be read. A12-A14 on iOS 26 have
+// no TXM. IOKit has no iOS SDK header, so it is resolved by name (ported from ARMSX3).
+static int ReadTXMPresent()
 {
-	glob_t g = {};
-	const int ret = glob("/System/Volumes/Preboot/*/boot/*/usr/standalone/firmware/FUD/Ap,TrustedExecutionMonitor.img4",
-		GLOB_NOSORT, nullptr, &g);
-	const bool found = (ret == 0 && g.gl_pathc > 0);
-	globfree(&g);
-	return found;
+	using FromPathFn = mach_port_t (*)(mach_port_t, const char*);
+	using PropertyFn = CFTypeRef (*)(mach_port_t, CFStringRef, CFAllocatorRef, uint32_t);
+	using ReleaseFn = kern_return_t (*)(mach_port_t);
+
+	void* iokit = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_LAZY);
+	if (!iokit)
+		return -1;
+	const auto from_path = reinterpret_cast<FromPathFn>(dlsym(iokit, "IORegistryEntryFromPath"));
+	const auto property = reinterpret_cast<PropertyFn>(dlsym(iokit, "IORegistryEntryCreateCFProperty"));
+	const auto release = reinterpret_cast<ReleaseFn>(dlsym(iokit, "IOObjectRelease"));
+	if (!from_path || !property || !release)
+		return -1;
+
+	const mach_port_t entry = from_path(MACH_PORT_NULL, "IODeviceTree:/chosen/memory-map");
+	if (entry == MACH_PORT_NULL)
+		return -1;
+	const CFTypeRef keys = property(entry, CFSTR("IORegistryEntryPropertyKeys"), kCFAllocatorDefault, 0);
+	release(entry);
+
+	int present = -1;
+	if (keys && CFGetTypeID(keys) == CFArrayGetTypeID())
+	{
+		const CFArrayRef array = static_cast<CFArrayRef>(keys);
+		present = CFArrayContainsValue(array, CFRangeMake(0, CFArrayGetCount(array)), CFSTR("TXM")) ? 1 : 0;
+	}
+	if (keys)
+		CFRelease(keys);
+	return present;
+}
+
+static xpc_object_t JailbreakServerSend(xpc_object_t message)
+{
+	using PipeCreateFn = xpc_object_t (*)(mach_port_t, uint64_t);
+	using PipeRoutineFn = int (*)(xpc_object_t, xpc_object_t, xpc_object_t*, uint64_t);
+	static const auto pipe_create = reinterpret_cast<PipeCreateFn>(dlsym(RTLD_DEFAULT, "xpc_pipe_create_from_port"));
+	static const auto pipe_routine = reinterpret_cast<PipeRoutineFn>(dlsym(RTLD_DEFAULT, "xpc_pipe_routine_with_flags"));
+	if (!pipe_create || !pipe_routine)
+		return nullptr;
+
+	xpc_object_t pipe = pipe_create(bootstrap_port, 0);
+	if (!pipe)
+		return nullptr;
+	xpc_object_t reply = nullptr;
+	if (pipe_routine(pipe, message, &reply, 0) != 0)
+		reply = nullptr;
+	xpc_release(pipe);
+	return reply;
+}
+
+// Dopamine's launchd jbserver, domain and action numbers from
+// libjailbreak/src/jbserver_domains.h (the same in 2.x and 3.x).
+static xpc_object_t JailbreakServerCall(uint64_t action, const char* key)
+{
+	constexpr uint64_t JBS_DOMAIN_SYSTEMWIDE = 1;
+	xpc_object_t message = xpc_dictionary_create_empty();
+	xpc_dictionary_set_uint64(message, "jb-domain", JBS_DOMAIN_SYSTEMWIDE);
+	xpc_dictionary_set_uint64(message, "action", action);
+	if (key)
+		xpc_dictionary_set_string(message, "key", key);
+	xpc_object_t reply = JailbreakServerSend(message);
+	xpc_release(message);
+	return reply;
 }
 #endif
+
+void DarwinMisc::TryJailbreakJITCheckin()
+{
+#if TARGET_OS_IPHONE && !TARGET_OS_SIMULATOR
+	bool systemhook = false;
+	for (u32 i = 0, count = _dyld_image_count(); i < count && !systemhook; i++)
+	{
+		const char* name = _dyld_get_image_name(i);
+		const size_t len = name ? std::strlen(name) : 0;
+		constexpr std::string_view suffix = "/systemhook.dylib";
+		systemhook = len >= suffix.size() && suffix == std::string_view(name + len - suffix.size());
+	}
+	const bool var_jb = access("/var/jb", F_OK) == 0;
+
+	u32 flags_before = 0;
+	ReadCsFlags(&flags_before);
+	int setting = -1;
+	int fully_debugged = -1;
+	const char* checkin = "skipped";
+
+	// Without systemhook nothing here is Dopamine's, so a stock device never
+	// sends launchd a jailbreak message.
+	if (systemhook)
+	{
+		constexpr uint64_t JBS_SYSTEMWIDE_PROCESS_CHECKIN = 4;
+		constexpr uint64_t JBS_SYSTEMWIDE_JBSETTINGS_GET = 7;
+		if (xpc_object_t reply = JailbreakServerCall(JBS_SYSTEMWIDE_JBSETTINGS_GET, "markAppsAsDebugged"))
+		{
+			if (xpc_object_t value = xpc_dictionary_get_value(reply, "value");
+				value && xpc_get_type(value) == XPC_TYPE_BOOL)
+				setting = xpc_bool_get_value(value) ? 1 : 0;
+			xpc_release(reply);
+		}
+
+		// The check-in is what marks an app debugged; repeat it for a launch
+		// where systemhook's own check-in didn't take.
+		if (!(flags_before & CS_DEBUGGED_FLAG))
+		{
+			checkin = "err";
+			if (xpc_object_t reply = JailbreakServerCall(JBS_SYSTEMWIDE_PROCESS_CHECKIN, nullptr))
+			{
+				checkin = "ok";
+				if (xpc_object_t value = xpc_dictionary_get_value(reply, "fully-debugged");
+					value && xpc_get_type(value) == XPC_TYPE_BOOL)
+					fully_debugged = xpc_bool_get_value(value) ? 1 : 0;
+				xpc_release(reply);
+			}
+		}
+	}
+
+	u32 flags_after = 0;
+	ReadCsFlags(&flags_after);
+	std::fprintf(stderr,
+		"@@JIT_JAILBREAK@@ systemhook=%d var_jb=%d setting=%d checkin=%s fully_debugged=%d cs_flags_before=0x%08x cs_flags_after=0x%08x\n",
+		systemhook ? 1 : 0, var_jb ? 1 : 0, setting, checkin, fully_debugged, flags_before, flags_after);
+	std::fflush(stderr);
+#endif
+}
 
 bool DarwinMisc::IsJITAvailable()
 {
@@ -679,8 +812,8 @@ bool DarwinMisc::IsJITAvailable()
 	return true;
 #elif TARGET_OS_IPHONE
 	u32 cs_flags = 0;
-	const int rv = csops(getpid(), 0, &cs_flags, sizeof(cs_flags));
-	const bool cs_debugged = (rv == 0) && ((cs_flags & 0x10000000u) != 0);
+	const int rv = ReadCsFlags(&cs_flags) ? 0 : -1;
+	const bool cs_debugged = (rv == 0) && ((cs_flags & CS_DEBUGGED_FLAG) != 0);
 	std::fprintf(stderr, "@@JIT_DETECT@@ csops=%d cs_flags=0x%08x CS_DEBUGGED=%d\n",
 		rv, cs_flags, cs_debugged ? 1 : 0);
 	std::fflush(stderr);
@@ -737,8 +870,7 @@ bool DarwinMisc::ValidateJITAlive()
 #if TARGET_OS_IPHONE && !TARGET_OS_SIMULATOR
 	// Check 1: CS_DEBUGGED still set?
 	u32 cs_flags = 0;
-	const int rv = csops(getpid(), 0, &cs_flags, sizeof(cs_flags));
-	const bool cs_debugged = (rv == 0) && ((cs_flags & 0x10000000u) != 0);
+	const bool cs_debugged = ReadCsFlags(&cs_flags) && ((cs_flags & CS_DEBUGGED_FLAG) != 0);
 	if (!cs_debugged)
 	{
 		std::fprintf(stderr, "@@JIT_KEEPALIVE@@ alive=0 reason=cs_debugged_revoked\n");
@@ -851,11 +983,15 @@ DarwinMisc::JitMode DarwinMisc::DetectJitMode()
 		std::snprintf(version, sizeof(version), "0");
 
 	const int major = std::atoi(version);
-	const bool has_txm = HasTXM();
-	if (major >= 26)
-		s_jit_mode = JitMode::LuckTXM;
-	else
+	// DolphiniOS's split: before iOS 26 every device flips pages, from 26 the
+	// executable side is never writable, and only TXM needs the debugger to prepare it.
+	const int txm = ReadTXMPresent();
+	if (major < 26)
 		s_jit_mode = JitMode::Legacy;
+	else if (txm == 0)
+		s_jit_mode = JitMode::LuckNoTXM;
+	else
+		s_jit_mode = JitMode::LuckTXM;
 
 	if (const char* force_dual = std::getenv("ARMSX2_FORCE_DUAL_MAP"))
 	{
@@ -863,8 +999,8 @@ DarwinMisc::JitMode DarwinMisc::DetectJitMode()
 			s_jit_mode = JitMode::LuckNoTXM;
 	}
 
-	std::fprintf(stderr, "@@JIT_MODE@@ version=%s major=%d txm_probe=%d mode=%s (%d)\n",
-		version, major, has_txm ? 1 : 0, JitModeName(s_jit_mode), static_cast<int>(s_jit_mode));
+	std::fprintf(stderr, "@@JIT_MODE@@ version=%s major=%d txm=%d mode=%s (%d)\n",
+		version, major, txm, JitModeName(s_jit_mode), static_cast<int>(s_jit_mode));
 	std::fflush(stderr);
 #else
 	s_jit_mode = JitMode::Legacy;
@@ -1221,6 +1357,114 @@ void DarwinMisc::MunmapCodeDualMap(void* rx_ptr, size_t size)
 	s_legacy_code_size = 0;
 	s_legacy_is_writable = true;
 	s_legacy_range_log_done = false;
+#endif
+}
+
+#if TARGET_OS_IPHONE && !TARGET_OS_SIMULATOR
+namespace
+{
+	constexpr int SELFTEST_SIGNALS[3] = {SIGBUS, SIGSEGV, SIGILL};
+	struct sigaction s_selftest_saved[3];
+	sigjmp_buf s_selftest_jmp;
+	pthread_t s_selftest_thread;
+	volatile sig_atomic_t s_selftest_signal = 0;
+
+	void SelfTestFaultHandler(int sig)
+	{
+		if (!pthread_equal(pthread_self(), s_selftest_thread))
+		{
+			// Another thread's fault: put its handler back and let the instruction fault again under it.
+			for (int i = 0; i < 3; i++)
+			{
+				if (SELFTEST_SIGNALS[i] == sig)
+					sigaction(sig, &s_selftest_saved[i], nullptr);
+			}
+			return;
+		}
+		s_selftest_signal = sig;
+		siglongjmp(s_selftest_jmp, 1);
+	}
+} // namespace
+#endif
+
+int DarwinMisc::VerifyCodeExecutes(void* rx_ptr, size_t size)
+{
+#if TARGET_OS_IPHONE && !TARGET_OS_SIMULATOR
+	// With CS_KILL still set, running an unsigned page is a kill no handler can catch.
+	u32 flags = 0;
+	if (!ReadCsFlags(&flags) || !(flags & CS_DEBUGGED_FLAG) || (flags & CS_KILL_FLAG))
+	{
+		std::fprintf(stderr, "@@JIT_SELFTEST@@ result=skipped cs_flags=0x%08x mode=%s\n", flags, JitModeName(GetJitMode()));
+		std::fflush(stderr);
+		return -1;
+	}
+
+	const size_t page = HostSys::GetRuntimePageSize() ? HostSys::GetRuntimePageSize() : static_cast<size_t>(getpagesize());
+	u8* const exec = static_cast<u8*>(rx_ptr) + size - page;
+	u8* const write = exec + g_code_rw_offset;
+	const bool legacy = g_code_rw_offset == 0 && s_legacy_code_base;
+	constexpr u32 stub[2] = {0x52800540u /* mov w0, #42 */, 0xd65f03c0u /* ret */};
+
+	bool ready;
+	if (legacy)
+	{
+		ready = LegacyProtectCodeRange(exec, page, PROT_READ | PROT_WRITE, "selftest_rw");
+		if (ready)
+		{
+			std::memcpy(write, stub, sizeof(stub));
+			ready = LegacyProtectCodeRange(exec, page, PROT_READ | PROT_EXEC, "selftest_rx");
+		}
+	}
+	else
+	{
+		HostSys::BeginCodeWrite();
+		std::memcpy(write, stub, sizeof(stub));
+		HostSys::EndCodeWrite();
+		ready = true;
+	}
+	sys_icache_invalidate(exec, sizeof(stub));
+
+	int value = -1;
+	s_selftest_signal = 0;
+	if (ready)
+	{
+		struct sigaction sa = {};
+		sa.sa_handler = SelfTestFaultHandler;
+		sigemptyset(&sa.sa_mask);
+		for (int i = 0; i < 3; i++)
+			sigaction(SELFTEST_SIGNALS[i], &sa, &s_selftest_saved[i]);
+
+		// Its own thread, because the CPU thread's Mach port would take the fault as a fastmem miss.
+		std::thread worker([&]() {
+			s_selftest_thread = pthread_self();
+			if (sigsetjmp(s_selftest_jmp, 1) == 0)
+				value = reinterpret_cast<int (*)()>(exec)();
+		});
+		worker.join();
+
+		for (int i = 0; i < 3; i++)
+			sigaction(SELFTEST_SIGNALS[i], &s_selftest_saved[i], nullptr);
+	}
+
+	if (legacy)
+	{
+		if (LegacyProtectCodeRange(exec, page, PROT_READ | PROT_WRITE, "selftest_restore"))
+			std::memset(write, 0, sizeof(stub));
+	}
+	else
+	{
+		HostSys::BeginCodeWrite();
+		std::memset(write, 0, sizeof(stub));
+		HostSys::EndCodeWrite();
+	}
+
+	const bool ok = value == 42;
+	std::fprintf(stderr, "@@JIT_SELFTEST@@ result=%s value=%d signal=%d protect=%d mode=%s\n",
+		ok ? "ok" : "fail", value, static_cast<int>(s_selftest_signal), ready ? 1 : 0, JitModeName(GetJitMode()));
+	std::fflush(stderr);
+	return ok ? 1 : 0;
+#else
+	return 1;
 #endif
 }
 

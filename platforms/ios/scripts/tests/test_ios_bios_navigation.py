@@ -7,7 +7,9 @@ from ios_source import block, read, swift, without_comments
 
 
 BIOS = swift("BIOSListView.swift")
+ROW = swift("BIOSRow.swift")
 ROOT = swift("RootView.swift")
+MENU_TABS = swift("MenuTabView.swift")
 
 
 class BIOSOnTheSharedNavigation(unittest.TestCase):
@@ -17,7 +19,7 @@ class BIOSOnTheSharedNavigation(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.bios = without_comments(read(BIOS))
-        cls.root = without_comments(read(ROOT))
+        cls.root = without_comments(read(ROOT) + read(MENU_TABS))
 
     def test_the_page_registers_a_navigation_session(self):
         self.assertIn(".controllerAccessibilityNavigation(", self.bios)
@@ -32,7 +34,7 @@ class BIOSOnTheSharedNavigation(unittest.TestCase):
         self.assertEqual(len(listeners), 1, "only the prompt listener should read raw events")
 
     def test_rows_and_toolbar_are_targets(self):
-        self.assertIn("id: bios.filePath", block(self.bios, "private func biosRow("))
+        self.assertIn("id: bios.filePath", block(without_comments(read(ROW)), "struct BIOSRow"))
         for target in ("BIOSControllerTarget.boot", "BIOSControllerTarget.importBIOS",
                        "BIOSControllerTarget.refresh"):
             with self.subTest(target=target):
