@@ -131,6 +131,10 @@ enum class DriverBug : u8
 	BrokenBlendConstant,
 	/// The shader compiler crashes on any pipeline that queries an image size (textureSize).
 	BrokenImageQuery,
+	/// A draw that samples with implicit derivatives (the hardware's lod), drawn in one host draw with draws of
+	/// another kind, gets some pixels wrong, differently from one replay to the next. The run machine then keeps
+	/// one sampling call per run (GSRunsPolicy::LodJoins).
+	BrokenMixedSamplingDerivatives,
 	Count,
 };
 
@@ -345,7 +349,7 @@ constexpr u32 VULKAN_PUSH_DESCRIPTORS_REQUIRED = 7;
 /// Mali on every driver but malisx2 and PanVK, where the database names Arm's.
 struct VulkanDeviceRules
 {
-	/// Mali-G615: timestamp queries never resolve, and the present spin that waits on them stalls.
+	/// Mali-G615: timestamp queries never resolve, so GPU timing is off.
 	bool broken_timestamp_queries = false;
 	/// The attachment-feedback-loop layout is not used, so the in-pass self-read is spelled as a
 	/// subpass input attachment instead.
@@ -392,6 +396,10 @@ struct VulkanDeviceRules
 	/// barriers. Needs the input-attachment spelling, so it applies only with
 	/// avoid_feedback_loop_layout. Fixes tab -> Disable Framebuffer Fetch returns to the barrier road.
 	bool ordered_input_attachment_read = false;
+	/// Mali, any part and driver: Spin GPU During Readbacks is not run. On a Mali-G57 with malisx2 and
+	/// calibrated timestamps, spin on and off gave the same frame times and CPU time in every scene
+	/// with readbacks (1 to 4 per frame).
+	bool skip_readback_spin = false;
 };
 
 /// A VulkanDeviceRules flag and the name the log and the driver report print it under.
@@ -415,6 +423,7 @@ inline constexpr VulkanDeviceRuleName VULKAN_DEVICE_RULE_NAMES[] = {
 	{"barrier_road_measured", &VulkanDeviceRules::barrier_road_measured},
 	{"exempt_malisx2_push_descriptors", &VulkanDeviceRules::exempt_malisx2_push_descriptors},
 	{"ordered_input_attachment_read", &VulkanDeviceRules::ordered_input_attachment_read},
+	{"skip_readback_spin", &VulkanDeviceRules::skip_readback_spin},
 };
 static_assert(sizeof(VulkanDeviceRules) == sizeof(VULKAN_DEVICE_RULE_NAMES) / sizeof(VULKAN_DEVICE_RULE_NAMES[0]),
 	"VulkanDeviceRules is all bool flags; every one needs a VULKAN_DEVICE_RULE_NAMES entry");
