@@ -4,6 +4,7 @@
 #pragma once
 
 #include <map>
+#include <set>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -169,9 +170,9 @@ struct MemoryCardFileMetadataReference
 
 struct MemoryCardFileHandleStructure
 {
-	MemoryCardFileMetadataReference* fileRef;
 	std::string hostFilePath;
 	std::FILE* fileHandle;
+	bool writable; // false when the host would only open the file for reading
 };
 
 // --------------------------------------------------------------------------------------
@@ -183,13 +184,23 @@ class FileAccessHelper
 private:
 	std::map<std::string, MemoryCardFileHandleStructure> m_files;
 	MemoryCardFileMetadataReference* m_lastWrittenFileRef = nullptr; // we remember this to reduce redundant metadata checks/writes
+	// host files whose read or write failure has been reported, so each is reported once per card session
+	std::set<std::string> m_reportedFiles;
+	size_t m_reportCount = 0;
+	// host files that could not be opened; not tried again until ForgetFailedOpens()
+	std::set<std::string> m_failedOpens;
 
 public:
 	FileAccessHelper();
 	~FileAccessHelper();
 
 	// Get an already opened file if possible, or open a new one and remember it
-	std::FILE* ReOpen(const std::string_view folderName, MemoryCardFileMetadataReference* fileRef, bool writeMetadata = false);
+	// With forWriting, returns null for a file the host only lets us read, and writes the file's metadata.
+	// Returns null when the file cannot be opened; nothing is remembered then.
+	std::FILE* ReOpen(const std::string_view folderName, MemoryCardFileMetadataReference* fileRef, bool forWriting = false);
+	// Read from a host file by its path, through its handle if it is open; otherwise the file is opened
+	// for this read only. Returns the number of bytes read.
+	size_t ReadAt(const std::string& hostPath, s64 offset, u8* dest, u32 length);
 	// Close all open files that start with the given path, so either a file if a filename is given or all files in a directory and its subdirectories when a directory is given
 	void CloseMatching(const std::string_view path);
 	// Close all open files
@@ -199,6 +210,14 @@ public:
 
 	// Force metadata to be written on next file access, not sure if this is necessary but it can't hurt.
 	void ClearMetadataWriteState();
+
+	// Logs and shows on screen that a host file cannot be read, or written; once per file and kind
+	// until CloseAll().
+	void ReportFailure(const std::string& hostPath, bool writing);
+	// The number of failures reported since CloseAll().
+	size_t GetReportedFailureCount() const { return m_reportCount; }
+	// Lets files that could not be opened be tried again.
+	void ForgetFailedOpens() { m_failedOpens.clear(); }
 
 	// removes characters from a PS2 file name that would be illegal in a Windows file system
 	// returns true if any changes were made
@@ -211,10 +230,9 @@ private:
 	static bool CleanMemcardFilenameEndDotOrSpace(char* name, size_t length);
 
 	// Open a new file and remember it for later
-	std::FILE* Open(const std::string_view folderName, MemoryCardFileMetadataReference* fileRef, bool writeMetadata = false);
+	std::FILE* Open(const std::string_view folderName, MemoryCardFileMetadataReference* fileRef, bool forWriting = false);
 	// Close a file and delete its handle
-	// If entry is given, it also attempts to set the created and modified timestamps of the file according to the entry
-	void CloseFileHandle(std::FILE*& file, const MemoryCardFileEntry* entry = nullptr);
+	void CloseFileHandle(std::FILE*& file);
 
 	void WriteMetadata(const std::string_view folderName, const MemoryCardFileMetadataReference* fileRef);
 };
@@ -273,7 +291,16 @@ protected:
 	// stores directory and file metadata
 	std::map<u32, MemoryCardFileEntryCluster> m_fileEntryDict;
 	// quick-access map of related file entry metadata for each memory card FAT cluster that contains file data
+	// rebuilt from the directory entries on every flush
 	std::map<u32, MemoryCardFileMetadataReference> m_fileMetadataQuickAccess;
+	// the host file and cluster number within it that each data cluster had at the last flush that
+	// placed it; reads use it for a cluster the FAT marks in use that the map does not place
+	struct PreviousClusterOwner
+	{
+		std::string hostPath;
+		u32 consecutiveCluster;
+	};
+	std::map<u32, PreviousClusterOwner> m_previousClusterOwners;
 
 	// holds a copy of modified pages of the memory card before they're flushed to the file system
 	std::map<u32, MemoryCardPage> m_cache;
@@ -281,6 +308,9 @@ protected:
 	// used to reduce the amount of disk I/O by not re-writing unchanged data that just happened to be
 	// touched in memory due to how actual physical memory cards have to erase and rewrite in blocks
 	std::map<u32, MemoryCardPage> m_oldDataCache;
+	// set by a write to the cache, cleared by a flush that completes
+	bool m_writtenSinceFlush = false;
+
 	// if > 0, the amount of frames until data is flushed to the file system
 	// reset to FramesAfterWriteUntilFlush on each write
 	int m_framesUntilFlush;
@@ -474,6 +504,7 @@ protected:
 	void Flush();
 
 	// flush a single page of the cache to the internal data and/or host file system
+	// a page that could not be written stays cached; returns false if the page was not cached
 	bool FlushPage(const u32 page);
 
 	// flush a memory card cluster of the cache to the internal data and/or host file system
@@ -506,7 +537,8 @@ protected:
 	void RemoveUnchangedDataFromCache(const MemoryCardFileEntry* const oldEntry, const MemoryCardFileEntry* const newEntry);
 
 	// write data as Save() normally would, but ignore the cache; used for flushing
-	s32 WriteWithoutCache(const u8* src, u32 adr, int size);
+	// returns false when the data has no place on the host yet, or did not all reach it
+	bool WriteWithoutCache(const u8* src, u32 adr, int size);
 
 	// copies the contents of m_fileEntryDict into the tree structure fileEntryTree
 	void CopyEntryDictIntoTree(std::vector<MemoryCardFileEntryTreeNode>* fileEntryTree, const u32 cluster, const u32 fileCount);

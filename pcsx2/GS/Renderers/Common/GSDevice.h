@@ -725,11 +725,12 @@ struct alignas(16) GSHWDrawConfig
 				u8 point_size : 1;		///< Set when points need to be expanded without VS expanding.
 				VSExpand expand : 3;
 				u8 sprite_edge_clamp : 1; ///< ST carries each sprite's far-edge sample limit; see PSSelector::sprite_edge_clamp.
+				u8 sprite_ramp : 1; ///< ST carries each sprite's ramp marks; see PSSelector::sprite_ramp.
 			};
-			u8 key;
+			u16 key;
 		};
 		VSSelector(): key(0) {}
-		VSSelector(u8 k): key(k) {}
+		VSSelector(u16 k): key(k) {}
 
 		/// Returns true if the fixed index buffer should be used.
 		__fi bool UseFixedExpandIndexBuffer() const { return (expand == VSExpand::Point || expand == VSExpand::Sprite); }
@@ -737,7 +738,7 @@ struct alignas(16) GSHWDrawConfig
 		/// Return true if the index buffer should be bound as a vertex shader resource.
 		__fi bool UseVSExpandIndexBuffer() const { return (expand == VSExpand::TriangleAA1); }
 	};
-	static_assert(sizeof(VSSelector) == 1, "VSSelector is a single byte");
+	static_assert(sizeof(VSSelector) == 2, "VSSelector is two bytes");
 
 	struct PSSelector
 	{
@@ -871,6 +872,12 @@ struct alignas(16) GSHWDrawConfig
 				// last native pixel did. The limit rides in the vertex ST, which an FST sprite does
 				// not otherwise use; see CorrectSpriteCoverageForUpscale.
 				u32 sprite_edge_clamp : 1;
+
+				// A texel-coordinate sprite expanded in the vertex shader lowers U/V by a sixteenth of a
+				// texel past its first column/row on any axis that meets the console's ramp rule
+				// (GSCoordinateWalk.h, GSSpriteRampBias). The vertex shader decides per sprite and leaves
+				// the mark in ST; see GSRendererHW::SetupIA.
+				u32 sprite_ramp : 1;
 			};
 
 			struct
@@ -1605,6 +1612,7 @@ public:
 		bool broken_point_sampler : 1; ///< Issue with AMD cards, see tfx shader for details
 		bool vs_expand            : 1; ///< Supports expanding points/lines/sprites in the vertex shader
 		bool sprite_edge_clamp    : 1; ///< The shaders implement PSSelector::sprite_edge_clamp.
+		bool sprite_ramp          : 1; ///< The shaders implement PSSelector::sprite_ramp.
 		bool primitive_id         : 1; ///< Supports primitive ID for use with prim tracking destination alpha algorithm
 		bool texture_barrier      : 1; ///< Supports sampling rt and hopefully texture barrier
 		bool multidraw_fb_copy    : 1; ///< Replacement for texture barrier.

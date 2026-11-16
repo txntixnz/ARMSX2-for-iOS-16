@@ -32,6 +32,7 @@ add_pcsx2_test(gs_vertex_tests
 	gs_driver_report_tests.cpp
 	gs_vulkan_device_rules_tests.cpp
 	gs_vk_cached_dynamic_state_tests.cpp
+	gs_vk_calibrated_timestamps_tests.cpp
 	gs_gpu_profile_tests.cpp
 	gs_draw_staging_tests.cpp
 	gs_draw_env_snapshot_tests.cpp
@@ -77,6 +78,8 @@ add_pcsx2_test(gs_vertex_tests
 	gs_burst_memo_tests.cpp
 	gs_burst_memo_draw_tests.cpp
 	gs_alpha_known_bits_tests.cpp
+	gs_alpha_known_rects_tests.cpp
+	gs_alpha_known_rects_draw_tests.cpp
 	gs_depth_coverage_tests.cpp
 	gs_draw_alpha_mask_tests.cpp
 	gs_fast_stencil_shadow_tests.cpp
@@ -91,6 +94,7 @@ add_pcsx2_test(gs_vertex_tests
 	gs_sw_texture_readers_tests.cpp
 	gs_blend_constant_policy_tests.cpp
 	gs_runs_policy_tests.cpp
+	gs_run_snapshot_tests.cpp
 	gs_blend_carry_tests.cpp
 	gs_over_one_two_pass_tests.cpp
 	gs_autoflush_engine_level_tests.cpp

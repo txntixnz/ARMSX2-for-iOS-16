@@ -12,6 +12,7 @@
 #include "GS/Renderers/Vulkan/GSLsfg.h"
 #include "GS/Renderers/Vulkan/GSRunsVK.h"
 #include "GS/Renderers/Vulkan/VKBuilders.h"
+#include "GS/Renderers/Vulkan/VKCalibratedTimestamps.h"
 #include "GS/Renderers/Vulkan/VKShaderCache.h"
 #include "GS/Renderers/Vulkan/VKSwapChain.h"
 #include "GS/Renderers/Vulkan/VKLibretro.h"
@@ -48,6 +49,7 @@ namespace
 #include "GS/Renderers/Common/GSFramebufferFetchPolicy.h"
 #include "GS/Renderers/Common/GSMeasurementOverrides.h"
 #include "GS/Renderers/Common/GSSelfReadRoadPolicy.h"
+#include "GS/Renderers/Common/GSRunSnapshot.h"
 #include "GS/DriverReport/GSDriverReport.h"
 #include "GS/DriverReport/GSDriverReportActive.h"
 #include "GS/DriverReport/GSDriverReportClassify.h"
@@ -295,47 +297,23 @@ bool GSDeviceVK::SelectInstanceExtensions(ExtensionList* extension_list, const W
 		return false;
 	};
 
-	// Common extensions
-	if (wi.type != WindowInfo::Type::Surfaceless && !SupportsExtension(VK_KHR_SURFACE_EXTENSION_NAME, true))
-		return false;
+	const WindowSystemExtensions wsi = GetWindowSystemExtensions(wi);
+	for (const char* name : wsi.instance)
+	{
+		if (!SupportsExtension(name, true))
+			return false;
+	}
 
-#if defined(VK_USE_PLATFORM_WIN32_KHR)
-	if (wi.type == WindowInfo::Type::Win32 && !SupportsExtension(VK_KHR_WIN32_SURFACE_EXTENSION_NAME, true))
-		return false;
-#endif
-#if defined(VK_USE_PLATFORM_XLIB_KHR)
-	if (wi.type == WindowInfo::Type::X11 && !SupportsExtension(VK_KHR_XLIB_SURFACE_EXTENSION_NAME, true))
-		return false;
-#endif
-#if defined(VK_USE_PLATFORM_WAYLAND_KHR)
-	if (wi.type == WindowInfo::Type::Wayland && !SupportsExtension(VK_KHR_WAYLAND_SURFACE_EXTENSION_NAME, true))
-		return false;
-#endif
-#if defined(VK_USE_PLATFORM_METAL_EXT)
-	if (wi.type == WindowInfo::Type::MacOS && !SupportsExtension(VK_EXT_METAL_SURFACE_EXTENSION_NAME, true))
-		return false;
-#endif
-#if defined(VK_USE_PLATFORM_ANDROID_KHR)
-	if (wi.type == WindowInfo::Type::Android && !SupportsExtension(VK_KHR_ANDROID_SURFACE_EXTENSION_NAME, true))
-		return false;
-#endif
-
-	// VK_KHR_display direct-to-monitor surface (kmsdrm handhelds).
 	// VK_KHR_get_display_properties2 is optional but lets us read HDR / extended
 	// display info on ICDs that support it.
-	if (wi.type == WindowInfo::Type::VulkanDirect)
-	{
-		if (!SupportsExtension(VK_KHR_DISPLAY_EXTENSION_NAME, true))
-			return false;
+	if (wsi.type == WindowInfo::Type::VulkanDirect)
 		SupportsExtension(VK_KHR_GET_DISPLAY_PROPERTIES_2_EXTENSION_NAME, false);
-	}
 
 	// VK_EXT_debug_utils
 	if (enable_debug_utils && !SupportsExtension(VK_EXT_DEBUG_UTILS_EXTENSION_NAME, false))
 		Console.Warning("VK: Debug report requested, but extension is not available.");
 
-	oe->vk_swapchain_maintenance1 = wi.type != WindowInfo::Type::Surfaceless;
-	if (wi.type != WindowInfo::Type::Surfaceless)
+	if (wsi.type != WindowInfo::Type::Surfaceless)
 	{
 		oe->vk_swapchain_maintenance1 = true;
 		// VK_EXT_swapchain_maintenance1 requires VK_EXT_surface_maintenance1.
@@ -351,6 +329,39 @@ bool GSDeviceVK::SelectInstanceExtensions(ExtensionList* extension_list, const W
 	SupportsExtension(VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME, false);
 
 	return true;
+}
+
+GSDeviceVK::WindowSystemExtensions GSDeviceVK::GetWindowSystemExtensions(const WindowInfo& wi)
+{
+	WindowSystemExtensions exts;
+	const WindowInfo::Type type = wi.GetPresentType();
+	const char* platform_extension;
+	switch (type)
+	{
+#if defined(VK_USE_PLATFORM_WIN32_KHR)
+		case WindowInfo::Type::Win32: platform_extension = VK_KHR_WIN32_SURFACE_EXTENSION_NAME; break;
+#endif
+#if defined(VK_USE_PLATFORM_XLIB_KHR)
+		case WindowInfo::Type::X11: platform_extension = VK_KHR_XLIB_SURFACE_EXTENSION_NAME; break;
+#endif
+#if defined(VK_USE_PLATFORM_WAYLAND_KHR)
+		case WindowInfo::Type::Wayland: platform_extension = VK_KHR_WAYLAND_SURFACE_EXTENSION_NAME; break;
+#endif
+#if defined(VK_USE_PLATFORM_METAL_EXT)
+		case WindowInfo::Type::MacOS: platform_extension = VK_EXT_METAL_SURFACE_EXTENSION_NAME; break;
+#endif
+#if defined(VK_USE_PLATFORM_ANDROID_KHR)
+		case WindowInfo::Type::Android: platform_extension = VK_KHR_ANDROID_SURFACE_EXTENSION_NAME; break;
+#endif
+		// VK_KHR_display direct-to-monitor surface (kmsdrm handhelds).
+		case WindowInfo::Type::VulkanDirect: platform_extension = VK_KHR_DISPLAY_EXTENSION_NAME; break;
+		default: return exts;
+	}
+
+	exts.type = type;
+	exts.instance = {VK_KHR_SURFACE_EXTENSION_NAME, platform_extension};
+	exts.device = {VK_KHR_SWAPCHAIN_EXTENSION_NAME};
+	return exts;
 }
 
 GSDeviceVK::GPUList GSDeviceVK::EnumerateGPUs(VkInstance instance)
@@ -476,7 +487,7 @@ GSDeviceVK::GPUList GSDeviceVK::EnumerateGPUs()
 			const VkInstance instance = CreateVulkanInstance(WindowInfo(), &oe, false, false);
 			if (instance != VK_NULL_HANDLE)
 			{
-				if (Vulkan::LoadVulkanInstanceFunctions(instance))
+				if (Vulkan::LoadVulkanInstanceFunctions(instance, WindowInfo::Type::Surfaceless))
 					gpus = EnumerateGPUs(instance);
 
 				vkDestroyInstance(instance, nullptr);
@@ -490,7 +501,7 @@ GSDeviceVK::GPUList GSDeviceVK::EnumerateGPUs()
 	return gpus;
 }
 
-bool GSDeviceVK::SelectDeviceExtensions(ExtensionList* extension_list, bool enable_surface)
+bool GSDeviceVK::SelectDeviceExtensions(ExtensionList* extension_list)
 {
 	u32 extension_count = 0;
 	VkResult res = vkEnumerateDeviceExtensionProperties(m_physical_device, nullptr, &extension_count, nullptr);
@@ -536,8 +547,12 @@ bool GSDeviceVK::SelectDeviceExtensions(ExtensionList* extension_list, bool enab
 		return false;
 	};
 
-	if (enable_surface && !SupportsExtension(VK_KHR_SWAPCHAIN_EXTENSION_NAME, true))
-		return false;
+	// Window support follows the window system, whether or not a surface exists yet.
+	for (const char* name : m_window_system.device)
+	{
+		if (!SupportsExtension(name, true))
+			return false;
+	}
 
 	// Required extensions.
 	for (const char* extension_name : s_required_device_extensions)
@@ -551,8 +566,12 @@ bool GSDeviceVK::SelectDeviceExtensions(ExtensionList* extension_list, bool enab
 	m_optional_extensions.vk_khr_push_descriptor = SupportsExtension(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME, false);
 	m_optional_extensions.vk_ext_provoking_vertex = SupportsExtension(VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME, false);
 	m_optional_extensions.vk_ext_memory_budget = SupportsExtension(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME, false);
-	m_optional_extensions.vk_ext_calibrated_timestamps =
-		SupportsExtension(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME, false);
+	const Vulkan::CalibratedTimestampsName calibrated_timestamps = Vulkan::PickCalibratedTimestampsName(
+		[&SupportsExtension](const char* name) { return SupportsExtension(name, false); });
+	m_optional_extensions.vk_calibrated_timestamps =
+		(calibrated_timestamps != Vulkan::CalibratedTimestampsName::Unsupported);
+	m_optional_extensions.vk_calibrated_timestamps_is_khr =
+		(calibrated_timestamps == Vulkan::CalibratedTimestampsName::KHR);
 	// ROAA is DUAL-NAMED: ARM shipped VK_ARM_rasterization_order_attachment_access (Mali
 	// driver r36p0), and the promoted VK_EXT_ alias only landed at r40p0. The structs/enums
 	// are identical (alias), so accept EITHER — otherwise Mali on r36-r39 blobs (a big chunk
@@ -620,7 +639,8 @@ bool GSDeviceVK::SelectDeviceExtensions(ExtensionList* extension_list, bool enab
 
 #ifdef _WIN32
 	m_optional_extensions.vk_ext_full_screen_exclusive =
-		enable_surface && SupportsExtension(VK_EXT_FULL_SCREEN_EXCLUSIVE_EXTENSION_NAME, false);
+		m_window_system.type != WindowInfo::Type::Surfaceless &&
+		SupportsExtension(VK_EXT_FULL_SCREEN_EXCLUSIVE_EXTENSION_NAME, false);
 #endif
 
 	m_optional_extensions.vk_ext_fragment_shader_interlock = SupportsExtension(VK_EXT_FRAGMENT_SHADER_INTERLOCK_EXTENSION_NAME, false);
@@ -731,6 +751,11 @@ bool GSDeviceVK::CreateDevice(VkSurfaceKHR surface, bool enable_validation_layer
 			}
 		}
 	}
+	// A device that presents but has no surface yet to ask presents from the graphics queue. On
+	// Android every queue family can present, as the spec requires. VKSwapChain checks the queue
+	// against the surface when one arrives.
+	if (!surface && m_window_system.type != WindowInfo::Type::Surfaceless)
+		m_present_queue_family_index = m_graphics_queue_family_index;
 	for (uint32_t i = 0; i < queue_family_count; i++)
 	{
 		// Pick a queue for spinning
@@ -810,7 +835,7 @@ bool GSDeviceVK::CreateDevice(VkSurfaceKHR surface, bool enable_validation_layer
 	device_info.pQueueCreateInfos = queue_infos.data();
 
 	ExtensionList enabled_extensions;
-	if (!SelectDeviceExtensions(&enabled_extensions, surface != VK_NULL_HANDLE))
+	if (!SelectDeviceExtensions(&enabled_extensions))
 		return false;
 	m_enabled_device_extensions.assign(enabled_extensions.begin(), enabled_extensions.end());
 
@@ -1063,15 +1088,13 @@ bool GSDeviceVK::CreateDevice(VkSurfaceKHR surface, bool enable_validation_layer
 	ModuleMap::Refresh();
 
 	// With the device created, we can fill the remaining entry points.
-	if (!Vulkan::LoadVulkanDeviceFunctions(m_device))
+	if (!Vulkan::LoadVulkanDeviceFunctions(m_device, !m_window_system.device.empty()))
 		return false;
 
 	// Grab the graphics and present queues.
 	vkGetDeviceQueue(m_device, m_graphics_queue_family_index, 0, &m_graphics_queue);
-	if (surface)
-	{
+	if (m_window_system.type != WindowInfo::Type::Surfaceless)
 		vkGetDeviceQueue(m_device, m_present_queue_family_index, 0, &m_present_queue);
-	}
 	m_spinning_supported = m_spin_queue_family_index != queue_family_count &&
 	                       queue_family_properties[m_graphics_queue_family_index].timestampValidBits > 0 &&
 	                       m_device_properties.limits.timestampPeriod > 0;
@@ -1109,7 +1132,7 @@ bool GSDeviceVK::CreateDevice(VkSurfaceKHR surface, bool enable_validation_layer
 		vkGetDeviceQueue(m_device, m_spin_queue_family_index, spin_queue_index, &m_spin_queue);
 
 		m_spin_timestamp_scale = m_device_properties.limits.timestampPeriod;
-		if (m_optional_extensions.vk_ext_calibrated_timestamps)
+		if (m_optional_extensions.vk_calibrated_timestamps)
 		{
 #ifdef _WIN32
 			LARGE_INTEGER Freq;
@@ -1254,29 +1277,40 @@ bool GSDeviceVK::ProcessDeviceExtensions()
 		m_optional_extensions.vk_ext_line_rasterization = false;
 	}
 
-	// VK_EXT_calibrated_timestamps checking
-	if (m_optional_extensions.vk_ext_calibrated_timestamps)
+	// Calibrated timestamps: the entry points of whichever name was enabled, the device time domain,
+	// and a host time domain GetCPUTimestamp reads.
+	const bool calibrated_is_khr = m_optional_extensions.vk_calibrated_timestamps_is_khr;
+	const PFN_vkGetPhysicalDeviceCalibrateableTimeDomainsKHR get_time_domains = calibrated_is_khr ?
+		vkGetPhysicalDeviceCalibrateableTimeDomainsKHR : vkGetPhysicalDeviceCalibrateableTimeDomainsEXT;
+	m_get_calibrated_timestamps = calibrated_is_khr ? vkGetCalibratedTimestampsKHR : vkGetCalibratedTimestampsEXT;
+	if (m_optional_extensions.vk_calibrated_timestamps && (!get_time_domains || !m_get_calibrated_timestamps))
+	{
+		Console.Warning("VK: VK_%s_calibrated_timestamps is enabled but its entry points did not load.",
+			calibrated_is_khr ? "KHR" : "EXT");
+		m_optional_extensions.vk_calibrated_timestamps = false;
+	}
+	if (m_optional_extensions.vk_calibrated_timestamps)
 	{
 		u32 count = 0;
-		vkGetPhysicalDeviceCalibrateableTimeDomainsEXT(m_physical_device, &count, nullptr);
-		std::unique_ptr<VkTimeDomainEXT[]> time_domains = std::make_unique<VkTimeDomainEXT[]>(count);
-		vkGetPhysicalDeviceCalibrateableTimeDomainsEXT(m_physical_device, &count, time_domains.get());
-		const VkTimeDomainEXT* begin = &time_domains[0];
-		const VkTimeDomainEXT* end = &time_domains[count];
-		if (std::find(begin, end, VK_TIME_DOMAIN_DEVICE_EXT) == end)
-			m_optional_extensions.vk_ext_calibrated_timestamps = false;
-		VkTimeDomainEXT preferred_types[] = {
+		get_time_domains(m_physical_device, &count, nullptr);
+		std::unique_ptr<VkTimeDomainKHR[]> time_domains = std::make_unique<VkTimeDomainKHR[]>(count);
+		get_time_domains(m_physical_device, &count, time_domains.get());
+		const VkTimeDomainKHR* begin = &time_domains[0];
+		const VkTimeDomainKHR* end = &time_domains[count];
+		if (std::find(begin, end, VK_TIME_DOMAIN_DEVICE_KHR) == end)
+			m_optional_extensions.vk_calibrated_timestamps = false;
+		VkTimeDomainKHR preferred_types[] = {
 #ifdef _WIN32
-			VK_TIME_DOMAIN_QUERY_PERFORMANCE_COUNTER_EXT,
+			VK_TIME_DOMAIN_QUERY_PERFORMANCE_COUNTER_KHR,
 #else
 #ifdef CLOCK_MONOTONIC_RAW
-			VK_TIME_DOMAIN_CLOCK_MONOTONIC_RAW_EXT,
+			VK_TIME_DOMAIN_CLOCK_MONOTONIC_RAW_KHR,
 #endif
-			VK_TIME_DOMAIN_CLOCK_MONOTONIC_EXT,
+			VK_TIME_DOMAIN_CLOCK_MONOTONIC_KHR,
 #endif
 		};
-		m_calibrated_timestamp_type = VK_TIME_DOMAIN_DEVICE_EXT;
-		for (VkTimeDomainEXT type : preferred_types)
+		m_calibrated_timestamp_type = VK_TIME_DOMAIN_DEVICE_KHR;
+		for (VkTimeDomainKHR type : preferred_types)
 		{
 			if (std::find(begin, end, type) != end)
 			{
@@ -1284,8 +1318,8 @@ bool GSDeviceVK::ProcessDeviceExtensions()
 				break;
 			}
 		}
-		if (m_calibrated_timestamp_type == VK_TIME_DOMAIN_DEVICE_EXT)
-			m_optional_extensions.vk_ext_calibrated_timestamps = false;
+		if (m_calibrated_timestamp_type == VK_TIME_DOMAIN_DEVICE_KHR)
+			m_optional_extensions.vk_calibrated_timestamps = false;
 	}
 
 	m_optional_extensions.vk_swapchain_maintenance1 &= 
@@ -1298,8 +1332,9 @@ bool GSDeviceVK::ProcessDeviceExtensions()
 		"VK_EXT_provoking_vertex is %s", m_optional_extensions.vk_ext_provoking_vertex ? "supported" : "NOT supported");
 	Console.WriteLn(
 		"VK_EXT_memory_budget is %s", m_optional_extensions.vk_ext_memory_budget ? "supported" : "NOT supported");
-	Console.WriteLn("VK_EXT_calibrated_timestamps is %s",
-		m_optional_extensions.vk_ext_calibrated_timestamps ? "supported" : "NOT supported");
+	Console.WriteLn("VK_%s_calibrated_timestamps is %s",
+		m_optional_extensions.vk_calibrated_timestamps_is_khr ? "KHR" : "EXT",
+		m_optional_extensions.vk_calibrated_timestamps ? "supported" : "NOT supported");
 	Console.WriteLn("VK_EXT_rasterization_order_attachment_access is %s",
 		m_optional_extensions.vk_ext_rasterization_order_attachment_access ? "supported" : "NOT supported");
 	Console.WriteLn("VK_%s_swapchain_maintenance1 is %s",
@@ -1890,12 +1925,12 @@ void GSDeviceVK::ReadGPUTiming(u32 index)
 			}
 			if (resources.spin_id >= 0)
 			{
-				if (m_optional_extensions.vk_ext_calibrated_timestamps && timestamps[1] > 0)
+				if (m_optional_extensions.vk_calibrated_timestamps && timestamps[1] > 0)
 				{
 					const u64 end = timestamps[1] * m_spin_timestamp_scale + m_spin_timestamp_offset;
 					m_spin_manager.DrawCompleted(resources.spin_id, resources.submit_timestamp, end);
 				}
-				else if (!m_optional_extensions.vk_ext_calibrated_timestamps && timestamps[0] > 0)
+				else if (!m_optional_extensions.vk_calibrated_timestamps && timestamps[0] > 0)
 				{
 					const u64 begin = timestamps[0] * m_spin_timestamp_scale;
 					const u64 end = timestamps[1] * m_spin_timestamp_scale;
@@ -2064,7 +2099,7 @@ void GSDeviceVK::SubmitCommandBuffer(VKSwapChain* present_swap_chain)
 		auto draw = m_spin_manager.DrawSubmitted(m_command_buffer_render_passes);
 		u32 constant_offset =
 			400000 * m_spin_manager.SpinsPerUnitTime(); // 400us, just to be safe since going over gets really bad
-		if (m_optional_extensions.vk_ext_calibrated_timestamps)
+		if (m_optional_extensions.vk_calibrated_timestamps)
 			constant_offset /=
 				2; // Safety factor isn't as important here, going over just hurts this one submission a bit
 		u32 minimum_spin = 200000 * m_spin_manager.SpinsPerUnitTime();
@@ -2085,14 +2120,19 @@ void GSDeviceVK::SubmitCommandBuffer(VKSwapChain* present_swap_chain)
 		if (m_spin_timer)
 			m_spin_timer--;
 		// Calibrate a max of once per frame
-		m_wants_new_timestamp_calibration = m_optional_extensions.vk_ext_calibrated_timestamps;
+		m_wants_new_timestamp_calibration = m_optional_extensions.vk_calibrated_timestamps;
 	}
 
 	if (spin_cycles != 0)
 		WaitForSpinCompletion(m_current_frame);
 
-	if (spin_enabled && m_optional_extensions.vk_ext_calibrated_timestamps)
+	if (spin_enabled && m_optional_extensions.vk_calibrated_timestamps)
 		resources.submit_timestamp = GetCPUTimestamp();
+
+	// The spin semaphore exists only when the spin runs on a queue of its own. On the graphics
+	// queue, submission order and the barrier at the top of the spin command buffer order the
+	// spin after this work, and there is no semaphore to signal.
+	const bool signal_spin = spin_cycles != 0 && !m_spin_queue_is_graphics_queue;
 
 	uint32_t wait_bits = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
 	VkSemaphore semas[2];
@@ -2107,7 +2147,7 @@ void GSDeviceVK::SubmitCommandBuffer(VKSwapChain* present_swap_chain)
 		submit_info.waitSemaphoreCount = 1;
 		submit_info.pWaitDstStageMask = &wait_bits;
 
-		if (spin_cycles != 0)
+		if (signal_spin)
 		{
 			semas[0] = present_swap_chain->GetRenderingFinishedSemaphore();
 			semas[1] = m_spin_resources[m_current_frame].semaphore;
@@ -2120,7 +2160,7 @@ void GSDeviceVK::SubmitCommandBuffer(VKSwapChain* present_swap_chain)
 			submit_info.signalSemaphoreCount = 1;
 		}
 	}
-	else if (spin_cycles != 0)
+	else if (signal_spin)
 	{
 		submit_info.signalSemaphoreCount = 1;
 		submit_info.pSignalSemaphores = &m_spin_resources[m_current_frame].semaphore;
@@ -2905,7 +2945,7 @@ void GSDeviceVK::SpinCommandCompleted(u32 index)
 	if (res == VK_SUCCESS)
 	{
 		u64 begin, end;
-		if (m_optional_extensions.vk_ext_calibrated_timestamps)
+		if (m_optional_extensions.vk_calibrated_timestamps)
 		{
 			begin = timestamps[0] * m_spin_timestamp_scale + m_spin_timestamp_offset;
 			end = timestamps[1] * m_spin_timestamp_scale + m_spin_timestamp_offset;
@@ -2995,28 +3035,28 @@ void GSDeviceVK::SubmitSpinCommand(u32 index, u32 cycles)
 
 void GSDeviceVK::CalibrateSpinTimestamp()
 {
-	if (!m_optional_extensions.vk_ext_calibrated_timestamps)
+	if (!m_optional_extensions.vk_calibrated_timestamps)
 		return;
-	VkCalibratedTimestampInfoEXT infos[2] = {
-		{VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_EXT, nullptr, VK_TIME_DOMAIN_DEVICE_EXT},
-		{VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_EXT, nullptr, m_calibrated_timestamp_type},
+	VkCalibratedTimestampInfoKHR infos[2] = {
+		{VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_KHR, nullptr, VK_TIME_DOMAIN_DEVICE_KHR},
+		{VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_KHR, nullptr, m_calibrated_timestamp_type},
 	};
 	u64 timestamps[2];
 	u64 maxDeviation;
 	constexpr u64 MAX_MAX_DEVIATION = 100000; // 100us
 	for (int i = 0; i < 4; i++) // 4 tries to get under MAX_MAX_DEVIATION
 	{
-		const VkResult res = vkGetCalibratedTimestampsEXT(m_device, std::size(infos), infos, timestamps, &maxDeviation);
+		const VkResult res = m_get_calibrated_timestamps(m_device, std::size(infos), infos, timestamps, &maxDeviation);
 		if (res != VK_SUCCESS)
 		{
-			LOG_VULKAN_ERROR(res, "vkGetCalibratedTimestampsEXT failed: ");
+			LOG_VULKAN_ERROR(res, "vkGetCalibratedTimestamps failed: ");
 			return;
 		}
 		if (maxDeviation < MAX_MAX_DEVIATION)
 			break;
 	}
 	if (maxDeviation >= MAX_MAX_DEVIATION)
-		Console.Warning("vkGetCalibratedTimestampsEXT returned high max deviation of %lluus", maxDeviation / 1000);
+		Console.Warning("vkGetCalibratedTimestamps returned high max deviation of %lluus", maxDeviation / 1000);
 	const double gpu_time = timestamps[0] * m_spin_timestamp_scale;
 #ifdef _WIN32
 	const double cpu_time = timestamps[1] * m_queryperfcounter_to_ns;
@@ -3034,7 +3074,7 @@ u64 GSDeviceVK::GetCPUTimestamp()
 	return static_cast<u64>(static_cast<double>(value.QuadPart) * m_queryperfcounter_to_ns);
 #else
 #ifdef CLOCK_MONOTONIC_RAW
-	const bool use_raw = m_calibrated_timestamp_type == VK_TIME_DOMAIN_CLOCK_MONOTONIC_RAW_EXT;
+	const bool use_raw = m_calibrated_timestamp_type == VK_TIME_DOMAIN_CLOCK_MONOTONIC_RAW_KHR;
 	const clockid_t clock = use_raw ? CLOCK_MONOTONIC_RAW : CLOCK_MONOTONIC;
 #else
 	const clockid_t clock = CLOCK_MONOTONIC;
@@ -3270,6 +3310,8 @@ void GSDeviceVK::Destroy()
 		s_libretro_present_count = 0;
 	}
 
+	DropRunSnapshot();
+
 	std::unique_lock lock(s_instance_mutex);
 
 	GSDriverReport::ClearActiveVulkanDriver();
@@ -3333,6 +3375,15 @@ bool GSDeviceVK::UpdateWindow()
 
 	if (m_window_info.type == WindowInfo::Type::Surfaceless)
 		return true;
+
+	// The instance and device were made for one window system; without it the surface functions
+	// are not loaded.
+	if (m_window_info.type != m_window_system.type)
+	{
+		Console.Error("VK: The device was created without support for this window's type (%d), not presenting.",
+			static_cast<int>(m_window_info.type));
+		return false;
+	}
 
 	// make sure previous frames are presented
 	ExecuteCommandBuffer(false);
@@ -3950,6 +4001,7 @@ bool GSDeviceVK::CreateDeviceAndSwapChain()
 
 	if (!AcquireWindow(true))
 		return false;
+	m_window_system = GetWindowSystemExtensions(m_window_info);
 
 	// Libretro context sharing: the VkInstance comes from the frontend's
 	// negotiation interface. Function loading still goes through the wrapped
@@ -3976,7 +4028,7 @@ bool GSDeviceVK::CreateDeviceAndSwapChain()
 		}
 	}
 
-	if (!Vulkan::LoadVulkanInstanceFunctions(m_instance))
+	if (!Vulkan::LoadVulkanInstanceFunctions(m_instance, m_window_system.type))
 	{
 		ERROR_LOG("Failed to load Vulkan instance functions");
 		return false;
@@ -4394,6 +4446,7 @@ void GSDeviceVK::ResolveFeatureTable()
 	m_features.provoking_vertex_last = m_optional_extensions.vk_ext_provoking_vertex;
 	m_features.vs_expand = !GSConfig.DisableVertexShaderExpand;
 	m_features.sprite_edge_clamp = true;
+	m_features.sprite_ramp = true;
 
 	if (!m_features.texture_barrier)
 		Console.Warning("VK: Texture buffers are disabled. This may break some graphical effects.");
@@ -5001,6 +5054,7 @@ void GSDeviceVK::DoCopyRect(GSTexture* sTex, GSTexture* dTex, const GSVector4i& 
 				m_runs->Flush(GSRunsVK::END_OTHER);
 			vkCmdClearAttachments(GetCurrentCommandBuffer(), 1, &ca, 1, &cr);
 			m_date_copy.valid = false; // see OMSetRenderTargets
+			m_run_snapshot.stale = 0xFF;
 
 			return;
 		}
@@ -5942,6 +5996,12 @@ void GSDeviceVK::OMSetRenderTargets(
 		// open narrower than their attachment today, so this is reachable now, not hypothetical.
 		// End the pass instead and leave the Cleared state alone, which puts the clear on the next
 		// pass's load op -- exactly what happens when this is reached outside a pass.
+
+		// Whichever way a pending clear or discard of the target is settled below, the kept copy of
+		// the target predates it.
+		if (vkRt && vkRt->GetState() != GSTexture::State::Dirty)
+			m_run_snapshot.stale = 0xFF;
+
 		const bool clear_pending = (vkRt && vkRt->GetState() == GSTexture::State::Cleared) ||
 								   (vkDs && vkDs->GetState() == GSTexture::State::Cleared);
 		if (clear_pending &&
@@ -7801,6 +7861,7 @@ VkShaderModule GSDeviceVK::GetTFXVertexShader(GSHWDrawConfig::VSSelector sel)
 	AddMacro(ss, "VS_POINT_SIZE", sel.point_size);
 	AddMacro(ss, "VS_EXPAND", static_cast<int>(sel.expand));
 	AddMacro(ss, "VS_SPRITE_EDGE_CLAMP", sel.sprite_edge_clamp);
+	AddMacro(ss, "VS_SPRITE_RAMP", sel.sprite_ramp);
 	ss << m_tfx_source;
 	std::string source = ss.str();
 	source_timer.reset();
@@ -7861,6 +7922,7 @@ VkShaderModule GSDeviceVK::GetTFXFragmentShader(const GSHWDrawConfig::PSSelector
 	AddMacro(ss, "PS_REGION_RECT", sel.region_rect);
 	AddMacro(ss, "PS_NATIVE_TEXEL_GRID", sel.native_texel_grid);
 	AddMacro(ss, "PS_SPRITE_EDGE_CLAMP", sel.sprite_edge_clamp);
+	AddMacro(ss, "PS_SPRITE_RAMP", sel.sprite_ramp);
 	AddMacro(ss, "PS_BLEND_A", sel.blend_a);
 	AddMacro(ss, "PS_BLEND_B", sel.blend_b);
 	AddMacro(ss, "PS_BLEND_C", sel.blend_c);
@@ -8204,18 +8266,19 @@ bool GSDeviceVK::IsLoadableTFXKey(const PipelineSelector& p)
 {
 	// The bytes after the last member are padding, zero in every selector a draw builds.
 	static constexpr size_t USED_BYTES = sizeof(GSHWDrawConfig::PSSelector) + sizeof(u32) +
-										 sizeof(GSHWDrawConfig::BlendState) + 4 * sizeof(u8);
-	static_assert(USED_BYTES <= sizeof(PipelineSelector));
+										 sizeof(GSHWDrawConfig::BlendState) + sizeof(GSHWDrawConfig::VSSelector) +
+										 sizeof(GSHWDrawConfig::DepthStencilSelector) +
+										 sizeof(GSHWDrawConfig::ColorMaskSelector);
+	static_assert(USED_BYTES < sizeof(PipelineSelector));
 	u8 tail[sizeof(PipelineSelector) - USED_BYTES];
 	std::memcpy(tail, reinterpret_cast<const u8*>(&p) + USED_BYTES, sizeof(tail));
 	if (std::any_of(std::begin(tail), std::end(tail), [](u8 b) { return b != 0; }))
 		return false;
 
 	// The flag word holds topology (2 bits), rt, ds, line_width, feedback_loop_flags (3), raster_order and
-	// stencil_counter (2): eleven bits, and stencil_counter goes to 2.
+	// stencil_counter (2): eleven bits, and stencil_counter goes to 2. The vertex selector uses nine bits.
 	return p.topology <= static_cast<u32>(GSHWDrawConfig::Topology::Triangle) && (p.key >> 11) == 0 &&
-		   p.stencil_counter <= 2 &&
-		   p.pad == 0 && p.bs.op <= GSDevice::OP_REV_SUBTRACT &&
+		   p.stencil_counter <= 2 && (p.vs.key >> 9) == 0 && p.bs.op <= GSDevice::OP_REV_SUBTRACT &&
 		   p.vs.expand <= GSHWDrawConfig::VSExpand::TriangleAA1 && p.dss._free == 0 &&
 		   p.cms._free == 0 && p.ps.atst <= GSShader::PS_ATST::NOTEQUAL && p.ps.afail <= GSShader::PS_AFAIL::RGB_ONLY_SW_Z &&
 		   p.ps.rov_depth <= GSShader::PS_ROV_DEPTH::READ_ONLY &&
@@ -8649,7 +8712,7 @@ void GSDeviceVK::ExecuteCommandBufferForReadback()
 		m_spin_timer = 30;
 		m_spin_manager.ReadbackRequested();
 
-		if (!m_optional_extensions.vk_ext_calibrated_timestamps && !m_warned_slow_spin)
+		if (!m_optional_extensions.vk_calibrated_timestamps && !m_warned_slow_spin)
 		{
 			m_warned_slow_spin = true;
 			Host::AddKeyedOSDMessage("GSDeviceVK_NoCalibratedTimestamps",
@@ -9255,6 +9318,10 @@ bool GSDeviceVK::ApplyUtilityState(bool already_execed)
 {
 	if (m_runs)
 		m_runs->Flush(GSRunsVK::END_OTHER);
+	// A utility draw into the open pass (a stretch onto the target it is already bound to) writes
+	// the target the kept copy describes.
+	if (m_run_snapshot.tex && m_current_render_target == m_run_snapshot.rt)
+		m_run_snapshot.stale = 0xFF;
 	if (m_current_pipeline_layout == PipelineLayout::Utility && m_dirty_flags == 0)
 		return true;
 
@@ -9682,6 +9749,13 @@ GSTextureVK* GSDeviceVK::SetupPrimitiveTrackingDATE(GSHWDrawConfig& config)
 	return image;
 }
 
+void GSDeviceVK::DropRunSnapshot()
+{
+	if (m_run_snapshot.tex)
+		Recycle(m_run_snapshot.tex);
+	m_run_snapshot = {};
+}
+
 bool GSDeviceVK::DateCopyLive(const GSHWDrawConfig& config)
 {
 	return m_date_copy.valid && InRenderPass() && m_date_copy.pass_serial == m_render_pass_serial &&
@@ -9690,6 +9764,13 @@ bool GSDeviceVK::DateCopyLive(const GSHWDrawConfig& config)
 
 void GSDeviceVK::DoRenderHW(GSHWDrawConfig& config)
 {
+	// What the draw writes makes those bits of the kept target copy stale (GSRunSnapshot.h). Here,
+	// because a draw the run machine merges returns below. The draw's own decision reads the set
+	// as it stood before.
+	const u8 snapshot_stale = m_run_snapshot.stale;
+	if (m_run_snapshot.tex)
+		m_run_snapshot.stale |= GSRunSnapshot::DrawWrites(config);
+
 	// The run machine (GSRunsVK.h) decides whether this draw can join a run, and ends the open run if not, before
 	// anything below records a command.
 	if (m_runs)
@@ -9809,6 +9890,18 @@ void GSDeviceVK::DoRenderHW(GSHWDrawConfig& config)
 
 	if (config.stencil_counter.enable && DrawStencilCounter(config))
 		return;
+
+	// The kept copy serves the pass it was taken for, on that pass's target. Every write to the
+	// target from outside this function ends the pass, marks the copy stale, or is still pending
+	// on the texture (GSRunSnapshot::Live).
+	const bool snapshot_pass_open = m_run_snapshot.tex && InRenderPass() &&
+	                                m_run_snapshot.pass_serial == m_render_pass_serial &&
+	                                m_run_snapshot.rt == m_current_render_target;
+	const bool snapshot_live = GSRunSnapshot::Live(m_run_snapshot.tex != nullptr, snapshot_pass_open,
+		snapshot_pass_open && m_current_render_target->GetState() == GSTexture::State::Dirty,
+		g_gs_device->GetColorClipTexture() != nullptr);
+	if (m_run_snapshot.tex && !snapshot_live)
+		DropRunSnapshot();
 
 	const GSVector2i rtsize(config.rt ? config.rt->GetSize() : config.ds->GetSize());
 	GSTextureVK* draw_rt = config.ps.HasColorROV() ? nullptr : static_cast<GSTextureVK*>(config.rt);
@@ -10087,9 +10180,39 @@ void GSDeviceVK::DoRenderHW(GSHWDrawConfig& config)
 
 	if (draw_rt && config.road.clone_rt)
 	{
-		// Requires a copy of the RT.
-		draw_rt_clone = static_cast<GSTextureVK*>(CreateTexture(rtsize.x, rtsize.y, 1, draw_rt->GetFormat(), true));
-		if (draw_rt_clone)
+		// Requires a copy of the RT: the kept one where it still holds what this draw reads
+		// (GSRunSnapshot.h), else a new one.
+		const GSRunSnapshot::Reads reads = colclip_rt ? GSRunSnapshot::Reads() : GSRunSnapshot::DrawReads(config);
+		const bool live = snapshot_live && m_run_snapshot.rt == draw_rt;
+		const bool covered = live && m_run_snapshot.area.rintersect(config.drawarea).eq(config.drawarea);
+		const GSRunSnapshot::Copy copy = GSRunSnapshot::Decide(live, snapshot_stale, covered, reads);
+		if (copy == GSRunSnapshot::Copy::Reuse)
+		{
+			draw_rt_clone = m_run_snapshot.tex;
+			PSSetShaderResource(2, draw_rt_clone, true);
+		}
+		else if (copy != GSRunSnapshot::Copy::Private)
+		{
+			if (m_run_snapshot.tex && (m_run_snapshot.tex->GetSize() != rtsize || m_run_snapshot.tex->GetFormat() != draw_rt->GetFormat()))
+				DropRunSnapshot();
+			if (!m_run_snapshot.tex)
+				m_run_snapshot.tex = static_cast<GSTextureVK*>(CreateTexture(rtsize.x, rtsize.y, 1, draw_rt->GetFormat(), true));
+			draw_rt_clone = m_run_snapshot.tex;
+			if (draw_rt_clone)
+			{
+				const GSVector4i area = (copy == GSRunSnapshot::Copy::Target) ? GSVector4i::loadh(rtsize) : config.drawarea;
+				GL_PUSH("VK: Copy RT to kept texture {%d,%d %dx%d}", area.left, area.top, area.width(), area.height());
+				EndRenderPass();
+				DoCopyRect(draw_rt, draw_rt_clone, area, area.left, area.top);
+				m_run_snapshot.rt = draw_rt;
+				m_run_snapshot.area = area;
+				m_run_snapshot.stale = GSRunSnapshot::DrawWrites(config);
+				PSSetShaderResource(2, draw_rt_clone, true);
+			}
+			else
+				Console.Warning("VK: Failed to allocate temp texture for RT copy.");
+		}
+		else if ((draw_rt_clone = static_cast<GSTextureVK*>(CreateTexture(rtsize.x, rtsize.y, 1, draw_rt->GetFormat(), true))))
 		{
 			GL_PUSH("VK: Copy RT to temp texture {%d,%d %dx%d}",
 				config.drawarea.left, config.drawarea.top,
@@ -10243,6 +10366,15 @@ void GSDeviceVK::DoRenderHW(GSHWDrawConfig& config)
 		}
 	}
 
+	// The kept target copy follows the target into the pass this draw opened. Nothing wrote the
+	// target between the pass it was live in and this one: only this function ran, and its setup
+	// draws write depth, stencil and scratch images.
+	if (m_run_snapshot.tex && m_run_snapshot.rt == m_current_render_target && !colclip_rt &&
+		(snapshot_live || draw_rt_clone == m_run_snapshot.tex))
+	{
+		m_run_snapshot.pass_serial = m_render_pass_serial;
+	}
+
 	// The pass the shared copy lives in is open now: this draw built the copy or found it live.
 	if (config.date_copy != GSAlphaBitLogicOp::NoDateCopy && config.destination_alpha == GSHWDrawConfig::DestinationAlphaMode::Stencil)
 		m_date_copy = {true, config.rt, config.ds, config.datm, m_render_pass_serial};
@@ -10363,7 +10495,7 @@ void GSDeviceVK::DoRenderHW(GSHWDrawConfig& config)
 		}
 	}
 
-	if (draw_rt_clone)
+	if (draw_rt_clone && draw_rt_clone != m_run_snapshot.tex)
 		Recycle(draw_rt_clone);
 
 	if (date_image)
@@ -10698,7 +10830,7 @@ void GSDeviceVK::CollectDriverReport(GSDriverReport::BackendReport& out) const
 #define OPT(name) w.KeyBool(#name, m_optional_extensions.name)
 	OPT(vk_ext_provoking_vertex);
 	OPT(vk_ext_memory_budget);
-	OPT(vk_ext_calibrated_timestamps);
+	OPT(vk_calibrated_timestamps);
 	OPT(vk_ext_rasterization_order_attachment_access);
 	OPT(vk_ext_roaa_depth);
 	OPT(vk_ext_full_screen_exclusive);

@@ -57,7 +57,8 @@ public:
 	{
 		bool vk_ext_provoking_vertex : 1;
 		bool vk_ext_memory_budget : 1;
-		bool vk_ext_calibrated_timestamps : 1;
+		bool vk_calibrated_timestamps : 1;
+		bool vk_calibrated_timestamps_is_khr : 1;
 		bool vk_ext_rasterization_order_attachment_access : 1;
 		bool vk_ext_roaa_depth : 1; ///< ROAA depth sub-feature (rasterizationOrderDepthAttachmentAccess); optional, often absent when color ROAA is present.
 		bool vk_ext_full_screen_exclusive : 1;
@@ -95,6 +96,19 @@ public:
 		/// bindings: the run machine (GSRunsVK) samples each merged draw's own texture from one array. Requested
 		/// wherever the driver has all three features.
 		bool vk_ext_descriptor_indexing : 1;
+	};
+
+	/// The extensions a window needs: VK_KHR_surface and the platform's surface extension on the
+	/// instance, VK_KHR_swapchain on the device. Decided from the window system the window presents
+	/// to (WindowInfo::GetPresentType), not from whether it has a surface right now, so a device
+	/// opened while the surface is gone can still present when it returns. Empty, with type
+	/// Surfaceless, for a run that never presents and for a window system this build has no Vulkan
+	/// support for.
+	struct WindowSystemExtensions
+	{
+		WindowInfo::Type type = WindowInfo::Type::Surfaceless;
+		std::vector<const char*> instance;
+		std::vector<const char*> device;
 	};
 
 	// Global state accessors
@@ -338,7 +352,7 @@ private:
 	using ExtensionList = std::vector<const char*>;
 	static bool SelectInstanceExtensions(ExtensionList* extension_list, const WindowInfo& wi, OptionalExtensions* oe,
 		bool enable_debug_utils);
-	bool SelectDeviceExtensions(ExtensionList* extension_list, bool enable_surface);
+	bool SelectDeviceExtensions(ExtensionList* extension_list);
 	bool SelectDeviceFeatures();
 	bool CreateDevice(VkSurfaceKHR surface, bool enable_validation_layer);
 	bool ProcessDeviceExtensions();
@@ -452,6 +466,10 @@ private:
 
 	GSStreamRingMemoryDecision m_stream_ring_memory;
 
+	// The window support the instance and device were created with, from the window at creation.
+	// Type Surfaceless if the device cannot present.
+	WindowSystemExtensions m_window_system;
+
 	VkQueue m_graphics_queue = VK_NULL_HANDLE;
 	VkQueue m_present_queue = VK_NULL_HANDLE;
 	u32 m_graphics_queue_family_index = 0;
@@ -488,7 +506,9 @@ private:
 	bool m_gpu_pipeline_statistics_enabled = false;
 	bool m_gpu_pipeline_statistics_supported = false;
 	bool m_wants_new_timestamp_calibration = false;
-	VkTimeDomainEXT m_calibrated_timestamp_type = VK_TIME_DOMAIN_DEVICE_EXT;
+	VkTimeDomainKHR m_calibrated_timestamp_type = VK_TIME_DOMAIN_DEVICE_KHR;
+	// vkGetCalibratedTimestampsKHR or vkGetCalibratedTimestampsEXT, whichever extension is enabled.
+	PFN_vkGetCalibratedTimestampsKHR m_get_calibrated_timestamps = nullptr;
 
 	std::array<FrameResources, NUM_COMMAND_BUFFERS> m_frame_resources;
 	u64 m_next_fence_counter = 1;
@@ -573,7 +593,6 @@ public:
 		GSHWDrawConfig::VSSelector vs;
 		GSHWDrawConfig::DepthStencilSelector dss;
 		GSHWDrawConfig::ColorMaskSelector cms;
-		u8 pad;
 
 		__fi bool operator==(const PipelineSelector& p) const { return BitEqual(*this, p); }
 		__fi bool operator!=(const PipelineSelector& p) const { return !BitEqual(*this, p); }
@@ -888,6 +907,9 @@ public:
 	/// Returns true if Vulkan is suitable as a default for the devices in the system.
 	static bool IsSuitableDefaultRenderer();
 
+	/// The window support a window needs. See WindowSystemExtensions.
+	static WindowSystemExtensions GetWindowSystemExtensions(const WindowInfo& wi);
+
 	__fi VkRenderPass GetTFXRenderPass(bool rt, bool ds, bool colclip, bool stencil, bool fbl, bool dsp,
 		VkAttachmentLoadOp rt_op, VkAttachmentLoadOp ds_op) const
 	{
@@ -1185,6 +1207,19 @@ private:
 		u64 pass_serial = 0;
 	};
 	DateCopy m_date_copy;
+	/// The copy of a render target kept for a run of draws on the copy road (GSRunSnapshot.h).
+	/// Live only inside the pass `pass_serial` names.
+	struct RunSnapshot
+	{
+		GSTextureVK* tex = nullptr;
+		const GSTextureVK* rt = nullptr;
+		GSVector4i area = GSVector4i::zero();
+		u64 pass_serial = 0;
+		/// Alpha bits of the target written since the copy.
+		u8 stale = 0;
+	};
+	RunSnapshot m_run_snapshot;
+	void DropRunSnapshot();
 	/// The next DeclareDrawFeedbackLoop declares the colour loop although the draw does not read (see
 	/// the shared DATE copy's setup in DoRenderHW).
 	bool m_declare_rt_loop_without_read = false;

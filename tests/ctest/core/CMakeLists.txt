@@ -51,6 +51,7 @@ add_pcsx2_test(core_test
 	ee_cycle_rate_controller_tests.cpp
 	ee_cycle_rate_eligibility_tests.cpp
 	ee_cycle_rate_sampler_tests.cpp
+	memcard_folder_tests.cpp
 	MockMemoryInterface.h
 	StubHost.cpp
 )
@@ -77,6 +78,7 @@ endif()
 if(USE_VULKAN)
 	target_sources(core_test PRIVATE lsfg_dll_check_tests.cpp)
 	target_sources(core_test PRIVATE lsfg_swap_chain_rebuild_tests.cpp)
+	target_sources(core_test PRIVATE vk_window_system_tests.cpp)
 endif()
 
 # The recompiler differential-test harness drives the arm64 JIT through
