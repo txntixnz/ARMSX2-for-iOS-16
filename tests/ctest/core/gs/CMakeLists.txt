@@ -23,6 +23,7 @@ add_pcsx2_test(gs_vertex_tests
 	gs_replacement_alpha_snap_tests.cpp
 	gs_copy_road_blending_tests.cpp
 	gs_native_texel_grid_tests.cpp
+	gs_target_size_policy_tests.cpp
 	gs_self_read_road_tests.cpp
 	gs_dynamic_feedback_loop_tests.cpp
 	gs_stream_ring_memory_tests.cpp
@@ -81,6 +82,7 @@ add_pcsx2_test(gs_vertex_tests
 	gs_alpha_known_rects_tests.cpp
 	gs_alpha_known_rects_draw_tests.cpp
 	gs_depth_coverage_tests.cpp
+	gs_zfloor_tests.cpp
 	gs_draw_alpha_mask_tests.cpp
 	gs_fast_stencil_shadow_tests.cpp
 	gs_stencil_counter_tests.cpp
