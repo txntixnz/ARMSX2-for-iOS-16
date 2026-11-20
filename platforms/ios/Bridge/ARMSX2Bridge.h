@@ -404,3 +404,12 @@ typedef void (^ARMSX2RetroAchievementsCompletion)(BOOL success, NSString * _Nonn
 + (void)logoutRetroAchievements;
 
 @end
+
+@interface ARMSX2Bridge (Diagnostics)
++ (nonnull NSString *)defaultSettingsINIText;
+// Stores the three [Logging] verbose keys and applies them to the running core now.
++ (void)setVerboseLogging:(BOOL)enabled;
+// Fires once within 3 seconds with a PNG of the last presented frame, or nil.
++ (void)capturePausedFrameWithCompletion:(nonnull void (^)(NSData *_Nullable png))completion;
+
+@end
