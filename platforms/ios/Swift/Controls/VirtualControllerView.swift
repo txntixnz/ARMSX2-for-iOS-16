@@ -10,7 +10,7 @@ let gameplaySurfaceTapNotification = Notification.Name("ARMSX2iOSGameplaySurface
 
 struct VirtualControllerView: View {
     @State private var settings = SettingsStore.shared
-    @State private var dynamicSettings = DynamicThumbstickSettings.shared
+    @State private var dynamicSettings = SettingsStore.shared.dynamicThumbsticks
     @State private var skinLibrary = VPadSkinLibraryStore.shared
     @State private var layout = PadLayoutStore.shared
     @State private var swipeInput = SwipeCameraInputDriver()
@@ -147,7 +147,7 @@ struct VirtualControllerView: View {
         }
         .onReceive(
             NotificationCenter.default.publisher(
-                for: Notification.Name("ARMSX2RetroAchievementsStateChanged")
+                for: .ARMSX2RetroAchievementsStateChanged
             )
         ) { _ in
             activeTouchActionSession.refreshHardcoreAutomaticFireRestriction()

@@ -157,7 +157,7 @@ final class PatchStore {
     /// carry on applying no matter what this screen says about them.
     static func hardcoreBlocksPnachContent() -> Bool {
         let state = ARMSX2Bridge.retroAchievementsState()
-        let active = (state["hardcoreActive"] as? NSNumber)?.boolValue ?? false
+        let active = (state[.hardcoreActive] as? NSNumber)?.boolValue ?? false
         return active || ARMSX2Bridge.isRetroAchievementsHardcoreActive()
     }
 
@@ -167,7 +167,7 @@ final class PatchStore {
     static func hardcorePendingRestart() -> Bool {
         guard !hardcoreBlocksPnachContent() else { return false }
         let state = ARMSX2Bridge.retroAchievementsState()
-        return (state["hardcorePreference"] as? NSNumber)?.boolValue ?? false
+        return (state[.hardcorePreference] as? NSNumber)?.boolValue ?? false
     }
 
     /// Presentation patches that stay legal under Hardcore: widescreen and 60fps from a
@@ -201,7 +201,7 @@ final class PatchStore {
         isoName = iso
         if let launchContext { self.launchContext = launchContext }
 
-        let info: [String: Any]
+        let info: [ARMSX2PerGameKey: Any]
         switch self.launchContext {
         case .library:
             info = ARMSX2Bridge.gameSettings(forISO: iso)
@@ -219,13 +219,13 @@ final class PatchStore {
             info = runtimeInfo
         }
 
-        let crcString = (info["crc"] as? String) ?? ""
+        let crcString = (info[.crc] as? String) ?? ""
         currentCRC = Self.formattedCRC(crcString)
-        currentSerial = PadLayoutGameIdentity.normalizedSerial(info["serial"] as? String)
+        currentSerial = PadLayoutGameIdentity.normalizedSerial(info[.serial] as? String)
         let metadataTitle = self.launchContext == .library
-            ? ARMSX2Bridge.gameMetadata(forISO: iso)["title"]
+            ? ARMSX2Bridge.gameMetadata(forISO: iso)[.title]
             : nil
-        currentTitle = ((info["title"] as? String) ?? metadataTitle ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        currentTitle = (metadataTitle ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         if currentTitle.isEmpty { currentTitle = iso }
         hasGameIdentity = !currentCRC.isEmpty
         identityState = hasGameIdentity
@@ -345,7 +345,7 @@ final class PatchStore {
         setEnableList(names, forISO: isoName, isCheat: entry.isCheat)
 
         if entry.isCheat {
-            ARMSX2Bridge.setINIBool("EmuCore", key: "EnableCheats", value: true)
+            SettingsStore.shared.enableCheats = true
         }
         ARMSX2Bridge.reloadPatches()
         loadInstalled(forISO: isoName, launchContext: launchContext)
@@ -389,7 +389,7 @@ final class PatchStore {
         setEnableList(mergedPatch, forISO: isoName, isCheat: false)
         setEnableList(mergedCheat, forISO: isoName, isCheat: true)
         if !mergedCheat.isEmpty {
-            ARMSX2Bridge.setINIBool("EmuCore", key: "EnableCheats", value: true)
+            SettingsStore.shared.enableCheats = true
         }
         ARMSX2Bridge.reloadPatches()
         loadInstalled(forISO: isoName, launchContext: launchContext)
@@ -548,7 +548,7 @@ final class PatchStore {
         }
         setEnableList(merged, forISO: iso, isCheat: asCheat)
         if asCheat {
-            ARMSX2Bridge.setINIBool("EmuCore", key: "EnableCheats", value: true)
+            SettingsStore.shared.enableCheats = true
         }
         ARMSX2Bridge.reloadPatches()
         return .success
@@ -695,8 +695,8 @@ final class PatchStore {
             return "\(currentSerial.uppercased())|\(currentCRC)"
         }
         let info = ARMSX2Bridge.gameSettings(forISO: iso)
-        let serial = ((info["serial"] as? String) ?? "").uppercased()
-        let crc = PadLayoutGameIdentity.normalizedCRC((info["crc"] as? String))
+        let serial = ((info[.serial] as? String) ?? "").uppercased()
+        let crc = PadLayoutGameIdentity.normalizedCRC((info[.crc] as? String))
         return "\(serial)|\(crc)"
     }
 

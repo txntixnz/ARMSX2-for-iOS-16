@@ -61,7 +61,6 @@ private enum EmulationOnlyNativeReleaseFlag {
 @Observable
 final class GameSession {
     static let shared = GameSession()
-    nonisolated static let emulationOnlyStartupReadyNotification = Notification.Name("ARMSX2iOSEmulationOnlyStartupReady")
 
     var runningGameName: String? = nil
     private(set) var vmShutdownPending = false
@@ -119,11 +118,9 @@ final class GameSession {
     private init() {
         // Read only persisted boot policy here, never SettingsStore.shared:
         // singleton initialization can itself reach AppState.
-        automaticGameStartupPending = ARMSX2Bridge.getINIBool(
-            "ARMSX2iOS/Boot", key: "AutomaticLoadLastGame", defaultValue: false
-        )
+        automaticGameStartupPending = SettingsStore._automaticLoadLastGameConfig.load()
         shutdownObserver = NotificationCenter.default.addObserver(
-            forName: NSNotification.Name("ARMSX2iOSVMDidShutdown"),
+            forName: .ARMSX2iOSVMDidShutdown,
             object: nil, queue: .main
         ) { [weak self] _ in MainActor.assumeIsolated {
             self?.reset()
@@ -145,7 +142,7 @@ final class GameSession {
 
         // Synchronize SwiftUI state when the native auto-boot path starts a VM.
         autoBootObserver = NotificationCenter.default.addObserver(
-            forName: NSNotification.Name("ARMSX2iOSAutoBootDidStart"),
+            forName: .ARMSX2iOSAutoBootDidStart,
             object: nil, queue: .main
         ) { [weak self] _ in MainActor.assumeIsolated {
             self?.isEmulationOnlyMode = false
@@ -159,7 +156,7 @@ final class GameSession {
         } }
 
         emulationOnlyStartupReadyObserver = NotificationCenter.default.addObserver(
-            forName: Self.emulationOnlyStartupReadyNotification,
+            forName: .ARMSX2iOSEmulationOnlyStartupReady,
             object: nil, queue: .main
         ) { [weak self] _ in MainActor.assumeIsolated {
             self?.emulationOnlyStartupReady = true
@@ -207,12 +204,8 @@ final class GameSession {
             return
         }
         // Older versions kept only BootISO; it stands in until a game boot records LastGame.
-        let legacyGame = ARMSX2Bridge.getINIString(
-            "GameISO", key: "BootISO", defaultValue: ""
-        )
-        let game = ARMSX2Bridge.getINIString(
-            "ARMSX2iOS/Boot", key: "LastGame", defaultValue: legacyGame
-        )
+        let legacyGame = SettingsStore._bootISOConfig.load()
+        let game = SettingsStore._lastGameConfig.load(default: legacyGame)
         guard !game.isEmpty, ARMSX2Bridge.canResolveISO(game) else {
             automaticGameStartupPending = false
             if !game.isEmpty {
@@ -299,8 +292,8 @@ final class GameSession {
         // Launches that know only the ISO name get the pad identity before GameScreenView mounts.
         let padSettings = ARMSX2Bridge.gameSettings(forISO: isoName)
         prepareGameplayPadSelection(
-            forSerial: gameplayPadSerial ?? (padSettings["serial"] as? String),
-            crc: (padSettings["crc"] as? String)
+            forSerial: gameplayPadSerial ?? (padSettings[.serial] as? String),
+            crc: (padSettings[.crc] as? String)
         )
         if launchTransition == nil {
             releaseMenuBackgroundResourcesForGameplay()
@@ -340,7 +333,7 @@ final class GameSession {
         Task { @MainActor in
             StikDebugLauncher.autoOpenIfNeeded(reason: "BIOS boot")
         }
-        ARMSX2Bridge.setINIString("GameISO", key: "BootISO", value: "")
+        SettingsStore._bootISOConfig.write("")
         ARMSX2Bridge.prepareGameRenderViewForCurrentRenderer()
         runningGameName = "BIOS"
         emulationSessionID = UUID()
@@ -364,7 +357,7 @@ final class GameSession {
         restoreMenuSystemChrome()
         currentScreen = .menu
         // Notify the UIKit host to restore the menu presentation.
-        NotificationCenter.default.post(name: NSNotification.Name("ARMSX2iOSReturnToMenu"), object: nil)
+        NotificationCenter.default.post(name: .ARMSX2iOSReturnToMenu, object: nil)
     }
 
     func returnToGame() {
@@ -372,7 +365,7 @@ final class GameSession {
             cancelGameplayLaunchTransition()
             releaseMenuBackgroundResourcesForGameplay()
             // Make the hosting surface transparent before revealing Metal output.
-            NotificationCenter.default.post(name: NSNotification.Name("ARMSX2iOSEnterGameScreen"), object: nil)
+            NotificationCenter.default.post(name: .ARMSX2iOSEnterGameScreen, object: nil)
             currentScreen = .playing
             ARMSX2Bridge.setVMPaused(false)
         }
@@ -688,7 +681,7 @@ final class GameSession {
             return gameName
         }
 
-        let bootISO = ARMSX2Bridge.getINIString("GameISO", key: "BootISO", defaultValue: "")
+        let bootISO = SettingsStore._bootISOConfig.load()
         if let gameName = normalizedRuntimeGameName(bootISO) {
             return gameName
         }
@@ -721,12 +714,12 @@ final class GameSession {
 
         for gameName in ARMSX2Bridge.availableISOs() {
             let metadata = ARMSX2Bridge.gameMetadata(forISO: gameName)
-            let serial = normalizedRuntimeIdentity(metadata["serial"])
+            let serial = normalizedRuntimeIdentity(metadata[.serial])
             if !serial.isEmpty && serial == identity {
                 return gameName
             }
 
-            if let crc = metadata["crc"]?.trimmingCharacters(in: .whitespacesAndNewlines).uppercased(),
+            if let crc = metadata[.crc]?.trimmingCharacters(in: .whitespacesAndNewlines).uppercased(),
                !crc.isEmpty,
                (identity == crc || identity == "CRC-\(crc)") {
                 return gameName

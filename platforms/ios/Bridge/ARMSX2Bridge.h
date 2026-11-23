@@ -3,6 +3,7 @@
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
+#import "ARMSX2BridgeKeys.h"
 
 typedef NS_ENUM(NSInteger, ARMSX2PadButton) {
     ARMSX2PadButtonUp = 0,
@@ -61,8 +62,8 @@ typedef void (^ARMSX2RetroAchievementsCompletion)(BOOL success, NSString * _Nonn
 + (nonnull NSString *)isoDirectory;
 + (nonnull NSString *)documentsDirectory;
 + (nonnull NSArray<NSString *> *)availableISOs;
-+ (nonnull NSArray<NSDictionary<NSString *, id> *> *)availableISOEntries;
-+ (nonnull NSDictionary<NSString *, NSString *> *)gameMetadataForISO:(nonnull NSString *)isoName;
++ (nonnull NSArray<NSDictionary<ARMSX2GameLibraryKey, id> *> *)availableISOEntries;
++ (nonnull NSDictionary<ARMSX2GameLibraryKey, NSString *> *)gameMetadataForISO:(nonnull NSString *)isoName;
 + (nullable NSString *)linkedDiscPathForELF:(nonnull NSString *)elfName NS_SWIFT_NAME(linkedDiscPath(forELF:));
 + (void)setLinkedDiscPath:(nullable NSString *)discPath forELF:(nonnull NSString *)elfName NS_SWIFT_NAME(setLinkedDiscPath(_:forELF:));
 + (nonnull NSString *)clearCacheForISO:(nonnull NSString *)isoName NS_SWIFT_NAME(clearCache(forISO:));
@@ -96,6 +97,7 @@ typedef void (^ARMSX2RetroAchievementsCompletion)(BOOL success, NSString * _Nonn
 // Device haptic fallback for game rumble when no rumble-capable controller is connected.
 + (void)triggerDeviceHapticLarge:(NSUInteger)large small:(NSUInteger)small;
 + (void)testControllerRumble;
++ (void)setRuntimeHapticFeedback:(BOOL)enabled;
 
 // Gamepad button mapping
 + (void)startButtonCapture;
@@ -206,16 +208,16 @@ typedef void (^ARMSX2RetroAchievementsCompletion)(BOOL success, NSString * _Nonn
 
 @interface ARMSX2Bridge (GameSettings)
 
-+ (nonnull NSDictionary<NSString *, id> *)gameSettingsForISO:(nullable NSString *)isoName NS_SWIFT_NAME(gameSettings(forISO:));
-+ (nonnull NSDictionary<NSString *, id> *)gameSettingsForSerial:(nullable NSString *)serial
-                                                            crc:(nullable NSString *)crc NS_SWIFT_NAME(gameSettings(forSerial:crc:));
-+ (nullable NSDictionary<NSString *, id> *)gameSettingsForCurrentGame;
++ (nonnull NSDictionary<ARMSX2PerGameKey, id> *)gameSettingsForISO:(nullable NSString *)isoName NS_SWIFT_NAME(gameSettings(forISO:));
++ (nonnull NSDictionary<ARMSX2PerGameKey, id> *)gameSettingsForSerial:(nullable NSString *)serial
+                                                                  crc:(nullable NSString *)crc NS_SWIFT_NAME(gameSettings(forSerial:crc:));
++ (nullable NSDictionary<ARMSX2PerGameKey, id> *)gameSettingsForCurrentGame;
 
 @end
 
 @interface ARMSX2Bridge (GameSettingsSave)
 
-+ (void)setGameSettings:(nonnull NSDictionary<NSString *, id> *)settings forISO:(nullable NSString *)isoName NS_SWIFT_NAME(setGameSettings(_:forISO:));
++ (void)setGameSettings:(nonnull NSDictionary<ARMSX2PerGameKey, id> *)settings forISO:(nullable NSString *)isoName NS_SWIFT_NAME(setGameSettings(_:forISO:));
 
 @end
 
@@ -391,8 +393,8 @@ typedef void (^ARMSX2RetroAchievementsCompletion)(BOOL success, NSString * _Nonn
 @interface ARMSX2Bridge (RetroAchievements)
 
 // RetroAchievements
-+ (nonnull NSDictionary<NSString *, id> *)retroAchievementsState;
-+ (nonnull NSArray<NSDictionary<NSString *, id> *> *)retroAchievementsForCurrentGame;
++ (nonnull NSDictionary<ARMSX2RAStateKey, id> *)retroAchievementsState;
++ (nonnull NSArray<NSDictionary<ARMSX2RAStateKey, id> *> *)retroAchievementsForCurrentGame;
 + (nullable ARMSX2RetroAchievementsToastInfo *)consumePendingRetroAchievementsNotification;
 + (BOOL)isRetroAchievementsHardcoreActive;
 + (void)setRetroAchievementsEnabled:(BOOL)enabled;

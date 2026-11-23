@@ -112,8 +112,6 @@ std::string ARMSX2HeldPath(const std::string& path)
     return path + ".held";
 }
 
-static NSString* const ARMSX2ExternalGameDirectoriesDefaultsKey = @"ARMSX2iOSExternalGameDirectories";
-
 static BOOL ARMSX2IsPathInsideDirectory(NSString* path, NSString* directory)
 {
 	if (path.length == 0 || directory.length == 0)
@@ -179,7 +177,7 @@ static void ARMSX2RememberExternalGameAccess(NSURL* url)
 
 NSArray<NSDictionary*>* ARMSX2ExternalGameDirectoryRecords()
 {
-	id rawRecords = [[NSUserDefaults standardUserDefaults] objectForKey:ARMSX2ExternalGameDirectoriesDefaultsKey];
+	id rawRecords = [[NSUserDefaults standardUserDefaults] objectForKey:ARMSX2iOSExternalGameDirectories];
 	if (![rawRecords isKindOfClass:NSArray.class]) {
 		if (rawRecords)
 			NSLog(@"[ARMSX2Bridge] External game folder records ignored unexpectedClass=%@", [rawRecords class]);
@@ -199,11 +197,11 @@ NSArray<NSDictionary*>* ARMSX2ExternalGameDirectoryRecords()
 
 BOOL ARMSX2ExternalGameRecordIsDirectory(NSDictionary* record, NSURL* url)
 {
-	id isDirectoryValue = record[@"isDirectory"];
+	id isDirectoryValue = record[ARMSX2GameLibraryKeyIsDirectory];
 	if ([isDirectoryValue isKindOfClass:NSNumber.class])
 		return [(NSNumber*)isDirectoryValue boolValue];
 
-	NSString* kind = [record[@"kind"] isKindOfClass:NSString.class] ? record[@"kind"] : nil;
+	NSString* kind = [record[ARMSX2GameLibraryKeyKind] isKindOfClass:NSString.class] ? record[ARMSX2GameLibraryKeyKind] : nil;
 	if ([kind isEqualToString:@"file"])
 		return NO;
 	if ([kind isEqualToString:@"folder"])
@@ -219,14 +217,14 @@ BOOL ARMSX2ExternalGameRecordIsDirectory(NSDictionary* record, NSURL* url)
 BOOL ARMSX2ExternalGameRecordIsCloudProvider(NSDictionary* record, NSURL* url)
 {
 	NSString* path = (url.path ?: @"").lowercaseString;
-	NSString* displayName = [record[@"displayName"] isKindOfClass:NSString.class] ? [(NSString*)record[@"displayName"] lowercaseString] : @"";
+	NSString* displayName = [record[ARMSX2GameLibraryKeyDisplayName] isKindOfClass:NSString.class] ? [(NSString*)record[ARMSX2GameLibraryKeyDisplayName] lowercaseString] : @"";
 	return [path containsString:@"google"] || [displayName containsString:@"google"];
 }
 
 NSURL* ARMSX2ResolveExternalGameDirectoryRecord(NSDictionary* record)
 {
-	NSString* path = [record[@"path"] isKindOfClass:NSString.class] ? record[@"path"] : nil;
-	NSData* bookmarkData = [record[@"bookmarkData"] isKindOfClass:NSData.class] ? record[@"bookmarkData"] : nil;
+	NSString* path = [record[ARMSX2GameLibraryKeyPath] isKindOfClass:NSString.class] ? record[ARMSX2GameLibraryKeyPath] : nil;
+	NSData* bookmarkData = [record[ARMSX2GameLibraryKeyBookmarkData] isKindOfClass:NSData.class] ? record[ARMSX2GameLibraryKeyBookmarkData] : nil;
 	if (bookmarkData.length > 0) {
 		BOOL stale = NO;
 		NSError* error = nil;
@@ -247,8 +245,8 @@ NSURL* ARMSX2ResolveExternalGameDirectoryRecord(NSDictionary* record)
 
 	if (path.length > 0) {
 		BOOL isDirectory = YES;
-		id isDirectoryValue = record[@"isDirectory"];
-		NSString* kind = [record[@"kind"] isKindOfClass:NSString.class] ? record[@"kind"] : nil;
+		id isDirectoryValue = record[ARMSX2GameLibraryKeyIsDirectory];
+		NSString* kind = [record[ARMSX2GameLibraryKeyKind] isKindOfClass:NSString.class] ? record[ARMSX2GameLibraryKeyKind] : nil;
 		if ([isDirectoryValue isKindOfClass:NSNumber.class])
 			isDirectory = [(NSNumber*)isDirectoryValue boolValue];
 		else if ([kind isEqualToString:@"file"])

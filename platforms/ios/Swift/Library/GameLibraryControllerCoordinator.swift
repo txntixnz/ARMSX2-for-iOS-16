@@ -32,7 +32,7 @@ final class GameLibraryControllerCoordinator {
     var gameSettingsTarget: ISOEntry?
     var gameSettingsStartsInShaders = false
     var preparedGameSettingsID: String?
-    var preparedGameSettings: [String: Any]?
+    var preparedGameSettings: [ARMSX2PerGameKey: Any]?
     var renameTarget: ISOEntry?
     var discLinkTarget: ISOEntry?
     var cheatsManagerTarget: ISOEntry?
@@ -125,7 +125,7 @@ final class GameLibraryControllerCoordinator {
             return settings.localized("Boot BIOS")
         }
         if let entry = library.games.first(where: { $0.bootName == name || $0.name == name }) {
-            let title = entry.metadata["title"]?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let title = entry.metadata[.title]?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             return title.isEmpty ? GameListView.cleanGameFileName(entry.name) : title
         }
         return GameListView.cleanGameFileName(name)

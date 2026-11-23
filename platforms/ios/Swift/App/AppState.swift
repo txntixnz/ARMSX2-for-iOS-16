@@ -10,7 +10,6 @@ final class AppState {
     static let shared = AppState()
     nonisolated static let systemChromeNeedsUpdateNotification = Notification.Name("ARMSX2iOSSystemChromeNeedsUpdate")
     static let releaseMenuBackgroundResourcesNotification = Notification.Name("ARMSX2iOSReleaseMenuBackgroundResources")
-    static let emulationOnlyResourcesReleasedNotification = Notification.Name("ARMSX2iOSEmulationOnlyResourcesReleased")
 
     enum Screen {
         case menu
@@ -48,9 +47,7 @@ final class AppState {
     @ObservationIgnored private var systemChromeNotificationsEnabled = false
 
     private init() {
-        let automaticGameStartup = ARMSX2Bridge.getINIBool(
-            "ARMSX2iOS/Boot", key: "AutomaticLoadLastGame", defaultValue: false
-        )
+        let automaticGameStartup = SettingsStore._automaticLoadLastGameConfig.load()
         // Seed the intro status bar before UIKit first asks for it, not in onAppear.
         // Automatic game startup skips the intro and leaves the bar to GameScreenView.
         if !automaticGameStartup {

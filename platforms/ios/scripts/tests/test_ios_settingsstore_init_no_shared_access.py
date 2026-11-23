@@ -36,6 +36,7 @@ STORE_FILES = [
     "SettingsStore+GraphicsRuntime.swift",
     "SettingsStore+GraphicsState.swift",
     "SettingsStore+Ranges.swift",
+    "SettingsStore+RetroAchievements.swift",
     "SettingsStore+RumbleMigration.swift",
     "SettingsStore+Runtime.swift",
     "SettingsStore+Speedhacks.swift",
@@ -43,6 +44,7 @@ STORE_FILES = [
     "SettingsStore.swift",
     "SettingsStoreAppearance.swift",
     "SettingsStoreController.swift",
+    "SettingsStoreDynamicThumbsticks.swift",
     "SettingsStoreNetwork.swift",
 ]
 
@@ -51,6 +53,7 @@ STORE_FILES = [
 AFTER_CLOSE = {
     "normalizeDEV9Settings": "writes the DEV9 INI keys back in their normal form and assigns "
                              "no stored property",
+    "setBool": "writes the fixed DoubleTapToHoldAim back and assigns no stored property",
     "snapshotCustomOsd": "seeds the Custom OSD snapshot in the INI and assigns no stored property",
 }
 
@@ -439,7 +442,11 @@ class TestIosSettingsStoreInitNoSharedAccess(unittest.TestCase):
                 body, deferred = self._split_init(init_body)
                 loads = self._stored_assignments(body, stored)
                 self.assertTrue(loads, "%s: found no load in init" % name)
-                close = loads[-1].start()
+                # A fix-up that assigns a property again after every load is not a load.
+                first = {}
+                for m in loads:
+                    first.setdefault(m.group("name"), m.start())
+                close = max(first.values())
                 for pattern in (BARE_CALL, MEMBER_CALL):
                     for m in pattern.finditer(body):
                         callee = m.group("name")

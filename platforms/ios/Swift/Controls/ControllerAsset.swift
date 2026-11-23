@@ -4,10 +4,11 @@
 import SwiftUI
 import UIKit
 
-private final class ControllerAssetImageCache: @unchecked Sendable {
+private final class ControllerAssetImageCache {
     let images = NSCache<NSString, UIImage>()
 }
 
+@MainActor
 enum ControllerAsset {
     private static let imageCache = ControllerAssetImageCache()
     private static let edgeToEdgePortraitAspectRatio: CGFloat = 1.55
