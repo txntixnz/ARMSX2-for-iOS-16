@@ -31,8 +31,15 @@ static constexpr bool IsDebugBuild = false;
 	#error Unsupported Platform
 #endif
 
-// Defines the memory page size for the target platform at compilation.
-#if defined(OVERRIDE_HOST_PAGE_SIZE)
+// Linux ARM64 kernels use 4, 16, or 64 KB pages, and Android devices ship
+// both 4 and 16 KB kernels. Initialize these once when the executable or
+// shared library is loaded, before memory mappings or JITs.
+#if defined(__linux__) && defined(ARCH_ARM64)
+	#define PCSX2_RUNTIME_PAGE_SIZE
+	extern const unsigned int __pagesize;
+	extern const unsigned int __pagemask;
+	extern const unsigned int __pageshift;
+#elif defined(OVERRIDE_HOST_PAGE_SIZE)
 	static constexpr unsigned int __pagesize = OVERRIDE_HOST_PAGE_SIZE;
 	static constexpr unsigned int __pagemask = __pagesize - 1;
 	static constexpr unsigned int __pageshift = std::bit_width(__pagemask);
