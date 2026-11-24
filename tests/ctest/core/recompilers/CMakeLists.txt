@@ -68,7 +68,6 @@ add_pcsx2_test(recompiler_tests
 	ee_rec_cycle_rate_tests.cpp
 	ee_rec_delay_slot_bracket_tests.cpp
 	ee_rec_divide_charge_tests.cpp
-	ee_rec_measured_charge_tests.cpp
 	ee_rec_fpu_tests.cpp
 	ee_rec_fpu_divunit_rounding_tests.cpp
 	ee_rec_fpu_full_mode_tests.cpp
@@ -87,6 +86,8 @@ add_pcsx2_test(recompiler_tests
 	ee_rec_pinned_gpr_tests.cpp
 	ee_rec_syscall_seam_tests.cpp
 	ee_rec_exception_charge_tests.cpp
+	ee_issue_model_tests.cpp
+	ee_rec_issue_charge_tests.cpp
 	ee_rec_event_stub_tests.cpp
 	ee_rec_extended_ram_tests.cpp
 	ee_rec_fast_forward_mark_tests.cpp
@@ -180,8 +181,8 @@ add_pcsx2_test(recompiler_tests
 	mvu_second_boot_tests.cpp
 	vuaot_frontend_tests.cpp
 	vuaot_live_tests.cpp
+	vuaot_bodies_tests.cpp
 	vuaot_lowering_tests.cpp
-	vuaot_persist_tests.cpp
 	mvu_ebit_condbranch_status_tests.cpp
 	mvu_options_sentinel_tests.cpp
 	mvu_model_stub_tests.cpp
@@ -190,6 +191,9 @@ add_pcsx2_test(recompiler_tests
 	mvu_branch_wrap_tests.cpp
 	mvu_compile_history_tests.cpp
 	mvu_flag_lookahead_range_tests.cpp
+	vu1_micro_address_tests.cpp
+	vu1_chunk_store_tests.cpp
+	vu1_chunk_pack_tests.cpp
 	vu0_macro_zero_sign_console_tests.cpp
 	# Conformance against real-hardware captures rather than against the other
 	# engine: each case is scored on interp and JIT separately, so a mistake the
