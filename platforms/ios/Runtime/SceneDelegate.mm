@@ -71,20 +71,132 @@ std::atomic<bool> s_loadLastSaveStateOnBoot{false};
     DarwinMisc::SetJITActivityQuery(&ARMSX2JITWorkerBusy);
 
     UIWindowScene *windowScene = (UIWindowScene *)scene;
-    
+
     static bool s_initialized = false;
     if (!s_initialized) {
         SDL_SetMainReady();
-        if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_GAMEPAD) < 0) {
+        if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_GAMEPAD)) {
             NSLog(@"SDL_Init failed: %s", SDL_GetError());
             return;
         }
         s_initialized = true;
     }
     ARMSX2InstallNativeGamepadDpadObserversOnMain();
-    
+
+    [self loadSettingsOnce];
+    ARMSX2_PostRetroAchievementsStateChanged();
+
+    Host::g_sdl_window = SDL_CreateWindow("PCSX2 iOS", 1280, 720, SDL_WINDOW_METAL | SDL_WINDOW_RESIZABLE);
+    if (!Host::g_sdl_window) {
+        Console.Error("Failed to create SDL window: %s", SDL_GetError());
+        return;
+    }
+
+    UIWindow *uiWindow = (__bridge UIWindow*)SDL_GetPointerProperty(SDL_GetWindowProperties(Host::g_sdl_window), SDL_PROP_WINDOW_UIKIT_WINDOW_POINTER, NULL);
+    if (uiWindow) {
+        uiWindow.windowScene = windowScene;
+        self.window = uiWindow;
+        self.window.backgroundColor = [UIColor systemGroupedBackgroundColor];
+        // SDL creates the original render controller. Keep it as a child of a
+        // GCEventViewController so UIKit can own menu focus without changing the
+        // CAMetalLayer host used by emulation.
+        UIViewController *sdlRootVC = uiWindow.rootViewController;
+        if (sdlRootVC) {
+            s_sdlRootVC = sdlRootVC;
+            UIViewController *eventHost =
+                [SwiftUIHost createControllerEventHostWithContentController:sdlRootVC];
+            if (eventHost) {
+                uiWindow.rootViewController = eventHost;
+                s_rootVC = eventHost;
+            }
+        }
+        // Before the window is on screen, so there is no wrong first frame.
+        [self syncRootViewToWindow];
+        [self.window makeKeyAndVisible];
+
+        // ProMotion only needs CADisableMinimumFrameDurationOnPhone in Info.plist. Pinning
+        // preferredFrameRateRange via -[UIUpdateLink initWithWindowScene:] crashes: no such selector.
+
+        // A reconnect keeps the view a running GS renders into; the new menu embeds it again.
+        if (!g_gameRenderView) {
+            g_gameRenderView = [[ARMSX2GameView alloc] initWithFrame:CGRectZero];
+            g_gameRenderView.backgroundColor = [UIColor blackColor];
+            g_gameRenderView.clipsToBounds = YES;
+        }
+        // Do NOT addSubview here — SwiftUI's MetalGameView handles view hierarchy
+    }
+
+    {
+        UIViewController *rootVC = self.window.rootViewController;
+        if (rootVC) {
+            rootVC.view.backgroundColor = [UIColor systemGroupedBackgroundColor];
+
+            if (connectionOptions.URLContexts.count > 0 || getenv("ARMSX2_BOOT_ELF") ||
+                getenv("ARMSX2_AUTO_BOOT")) {
+                [SwiftUIHost suppressAutomaticGameStartup];
+            }
+            UIViewController *menuVC = [SwiftUIHost createMenuController];
+            menuVC.view.translatesAutoresizingMaskIntoConstraints = NO;
+            menuVC.view.userInteractionEnabled = YES;
+// Keep hosting controller always clear — SwiftUI RootView handles its own background
+            menuVC.view.backgroundColor = [UIColor clearColor];
+            [rootVC.view addSubview:menuVC.view];
+            [NSLayoutConstraint activateConstraints:@[
+                [menuVC.view.topAnchor constraintEqualToAnchor:rootVC.view.topAnchor],
+                [menuVC.view.bottomAnchor constraintEqualToAnchor:rootVC.view.bottomAnchor],
+                [menuVC.view.leadingAnchor constraintEqualToAnchor:rootVC.view.leadingAnchor],
+                [menuVC.view.trailingAnchor constraintEqualToAnchor:rootVC.view.trailingAnchor],
+            ]];
+            [rootVC addChildViewController:menuVC];
+            [menuVC didMoveToParentViewController:rootVC];
+            s_menuVC = menuVC;
+            s_rootVC = rootVC;
+
+            [self syncRootViewToWindow];
+            Console.WriteLn("[UI] SwiftUI menu attached (screen: %.0fx%.0f)",
+                rootVC.view.bounds.size.width, rootVC.view.bounds.size.height);
+
+}
+    }
+
+    [self addVMObserversOnce];
+
+// Auto-boot — debug/simulator only
+#if DEBUG || TARGET_OS_SIMULATOR
+    if (getenv("ARMSX2_AUTO_BOOT") && atoi(getenv("ARMSX2_AUTO_BOOT")) == 1) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            Console.WriteLn("[AutoBoot] @@AUTO_BOOT@@ posting ARMSX2iOSRequestVMBoot + AutoBootDidStart");
+            [[NSNotificationCenter defaultCenter] postNotificationName:ARMSX2iOSRequestVMBoot object:nil];
+            [[NSNotificationCenter defaultCenter] postNotificationName:ARMSX2iOSAutoBootDidStart object:nil];
+        });
+    }
+#endif // DEBUG || TARGET_OS_SIMULATOR — AUTO_BOOT
+    // ps2autotests: auto-boot VM when ELF env var is set (always enabled)
+    if (getenv("ARMSX2_BOOT_ELF")) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            [[NSNotificationCenter defaultCenter] postNotificationName:ARMSX2iOSRequestVMBoot object:nil];
+        });
+    }
+
+    NSSet<UIOpenURLContext *> *launchURLContexts = connectionOptions.URLContexts;
+    if (launchURLContexts.count > 0) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            for (UIOpenURLContext *ctx in launchURLContexts) {
+                NSLog(@"[ARMSX2 iOS DeepLink] cold-launch host=%@", ctx.URL.host);
+                [DeepLinkBridge handle:ctx.URL];
+            }
+        });
+    }
+}
+
+- (void)loadSettingsOnce {
+    // Process-wide state that every boot reloads on the VM thread; a reconnect must not rewrite it.
+    static bool s_loaded = false;
+    if (s_loaded) return;
+    s_loaded = true;
+
     std::string dataRoot = [[ARMSX2Bridge documentsDirectory] UTF8String];
-    
+
     EmuFolders::DataRoot = dataRoot;
     EmuFolders::Bios = dataRoot + "/bios";
 
@@ -93,7 +205,7 @@ std::atomic<bool> s_loadLastSaveStateOnBoot{false};
         s_settings_interface = new INISettingsInterface(iniPath);
         if (!static_cast<INISettingsInterface*>(s_settings_interface)->Load()) {
             Console.WriteLn("Creating new config at %s", iniPath.c_str());
-            
+
             // [iPSX2] Standard Defaults: JIT Enabled (if supported), EE/IOP/VU Recompilers ON
             s_settings_interface->SetIntValue("EmuCore/CPU", "CoreType", 2); // ARM64 JIT in the Swift UI model
             s_settings_interface->SetBoolValue("EmuCore/CPU", "UseArm64Dynarec", true);
@@ -120,7 +232,6 @@ std::atomic<bool> s_loadLastSaveStateOnBoot{false};
             s_settings_interface->SetBoolValue("Achievements", "Enabled", false);
             s_settings_interface->SetBoolValue("Achievements", "ChallengeMode", false);
 
-            // iOS controller defaults.
             s_settings_interface->SetIntValue("ARMSX2iOS/Gamepad", "MultitapMode", 0);
 
             s_settings_interface->Save();
@@ -130,7 +241,7 @@ std::atomic<bool> s_loadLastSaveStateOnBoot{false};
         s_secrets_settings_interface = new INISettingsInterface(secretsPath);
         s_secrets_settings_interface->Load();
         Host::Internal::SetSecretsSettingsLayer(s_secrets_settings_interface);
-	// Load gamepad button mapping from INI
+    // Load gamepad button mapping from INI
         for (int i = 0; i < 16; i++) {
             char key[32]; snprintf(key, sizeof(key), "Button%d", i);
             int val = s_settings_interface->GetIntValue("ARMSX2iOS/GamepadMapping", key, s_defaultMap[i]);
@@ -176,7 +287,6 @@ std::atomic<bool> s_loadLastSaveStateOnBoot{false};
     Host::CommitBaseSettingChanges();
     [self checkAndConfigureBIOS];
 
-    // GS Renderer: Metal fixed on iOS.
     EmuConfig.GS.Renderer = GSRendererType::Metal;
     Host::CommitBaseSettingChanges();
 
@@ -191,84 +301,15 @@ std::atomic<bool> s_loadLastSaveStateOnBoot{false};
         ARMSX2IOSApplyRetroAchievementsOverlayDefaults(s_settings_interface, "after-startup-settings");
     }
     Host::CommitBaseSettingChanges();
-    VMManager::ApplySettings();
-    ARMSX2_PostRetroAchievementsStateChanged();
-    
-    Host::g_sdl_window = SDL_CreateWindow("PCSX2 iOS", 1280, 720, SDL_WINDOW_METAL | SDL_WINDOW_RESIZABLE);
-    if (!Host::g_sdl_window) {
-        Console.Error("Failed to create SDL window: %s", SDL_GetError());
-        return;
-    }
-    
-    UIWindow *uiWindow = (__bridge UIWindow*)SDL_GetPointerProperty(SDL_GetWindowProperties(Host::g_sdl_window), SDL_PROP_WINDOW_UIKIT_WINDOW_POINTER, NULL);
-    if (uiWindow) {
-        uiWindow.windowScene = windowScene;
-        self.window = uiWindow;
-        self.window.backgroundColor = [UIColor systemGroupedBackgroundColor];
-        // SDL creates the original render controller. Keep it as a child of a
-        // GCEventViewController so UIKit can own menu focus without changing the
-        // CAMetalLayer host used by emulation.
-        UIViewController *sdlRootVC = uiWindow.rootViewController;
-        if (sdlRootVC) {
-            s_sdlRootVC = sdlRootVC;
-            UIViewController *eventHost =
-                [SwiftUIHost createControllerEventHostWithContentController:sdlRootVC];
-            if (eventHost) {
-                uiWindow.rootViewController = eventHost;
-                s_rootVC = eventHost;
-            }
-        }
-        // Before the window is on screen, so there is no wrong first frame.
-        [self syncRootViewToWindow];
-        [self.window makeKeyAndVisible];
-
-        // ProMotion (120 Hz) unlock is just CADisableMinimumFrameDurationOnPhone
-        // in Info.plist. Don't pin preferredFrameRateRange via
-        // -[UIUpdateLink initWithWindowScene:]; that selector doesn't exist and
-        // crashes on cold launch.
-
-// Create game render view — SwiftUI MetalGameView (UIViewRepresentable) manages placement
-        g_gameRenderView = [[ARMSX2GameView alloc] initWithFrame:CGRectZero];
-        g_gameRenderView.backgroundColor = [UIColor blackColor];
-        g_gameRenderView.clipsToBounds = YES;
-        // Do NOT addSubview here — SwiftUI's MetalGameView handles view hierarchy
-    }
-    
-    // --- [UI] Startup Logic: Show menu first, boot on user action ---
-    {
-        UIViewController *rootVC = self.window.rootViewController;
-        if (rootVC) {
-            rootVC.view.backgroundColor = [UIColor systemGroupedBackgroundColor];
-
-            if (connectionOptions.URLContexts.count > 0 || getenv("ARMSX2_BOOT_ELF") ||
-                getenv("ARMSX2_AUTO_BOOT")) {
-                [SwiftUIHost suppressAutomaticGameStartup];
-            }
-            UIViewController *menuVC = [SwiftUIHost createMenuController];
-            menuVC.view.translatesAutoresizingMaskIntoConstraints = NO;
-            menuVC.view.userInteractionEnabled = YES;
-// Keep hosting controller always clear — SwiftUI RootView handles its own background
-            menuVC.view.backgroundColor = [UIColor clearColor];
-            [rootVC.view addSubview:menuVC.view];
-            [NSLayoutConstraint activateConstraints:@[
-                [menuVC.view.topAnchor constraintEqualToAnchor:rootVC.view.topAnchor],
-                [menuVC.view.bottomAnchor constraintEqualToAnchor:rootVC.view.bottomAnchor],
-                [menuVC.view.leadingAnchor constraintEqualToAnchor:rootVC.view.leadingAnchor],
-                [menuVC.view.trailingAnchor constraintEqualToAnchor:rootVC.view.trailingAnchor],
-            ]];
-            [rootVC addChildViewController:menuVC];
-            [menuVC didMoveToParentViewController:rootVC];
-            s_menuVC = menuVC;
-            s_rootVC = rootVC;
-
-            [self syncRootViewToWindow];
-            Console.WriteLn("[UI] SwiftUI menu attached (screen: %.0fx%.0f)",
-                rootVC.view.bounds.size.width, rootVC.view.bounds.size.height);
-
+    Host::RunOnCPUThread([]() { VMManager::ApplySettings(); }, false);
 }
-    }
 
-    // Listen for VM boot request from SwiftUI
+- (void)addVMObserversOnce {
+    // A second set after a reconnect would start the VM twice for one boot request.
+    static bool s_added = false;
+    if (s_added) return;
+    s_added = true;
+
     // queue:nil = synchronous delivery, so background colors are set BEFORE
     // SwiftUI re-renders the game overlay (avoids gray flash)
     [[NSNotificationCenter defaultCenter] addObserverForName:ARMSX2iOSRequestVMBoot
@@ -294,22 +335,18 @@ std::atomic<bool> s_loadLastSaveStateOnBoot{false};
 #endif
     }];
 
-    // ARMSX2iOSVMDidShutdown / ARMSX2iOSReturnToMenu: no rootVC background change needed.
-    // SwiftUI RootView handles menu background via Color(systemGroupedBackground).ignoresSafeArea().
-    // rootVC stays black after first boot — eliminates white flash during VM restart.
+    // RootView paints the menu background; rootVC stays black so a VM restart has no white flash.
 
     [[NSNotificationCenter defaultCenter] addObserverForName:ARMSX2iOSVMDidShutdown
                                                       object:nil
                                                        queue:nil
                                                   usingBlock:^(NSNotification * _Nonnull note) {
-        // No rootVC background change — SwiftUI handles menu bg
     }];
 
     [[NSNotificationCenter defaultCenter] addObserverForName:ARMSX2iOSReturnToMenu
                                                       object:nil
                                                        queue:nil
                                                   usingBlock:^(NSNotification * _Nonnull note) {
-        // No rootVC background change — SwiftUI handles menu bg
     }];
 
     [[NSNotificationCenter defaultCenter] addObserverForName:ARMSX2iOSEnterGameScreen
@@ -318,33 +355,6 @@ std::atomic<bool> s_loadLastSaveStateOnBoot{false};
                                                   usingBlock:^(NSNotification * _Nonnull note) {
         if (s_rootVC) s_rootVC.view.backgroundColor = [UIColor blackColor];
     }];
-
-// Auto-boot — debug/simulator only
-#if DEBUG || TARGET_OS_SIMULATOR
-    if (getenv("ARMSX2_AUTO_BOOT") && atoi(getenv("ARMSX2_AUTO_BOOT")) == 1) {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            Console.WriteLn("[AutoBoot] @@AUTO_BOOT@@ posting ARMSX2iOSRequestVMBoot + AutoBootDidStart");
-            [[NSNotificationCenter defaultCenter] postNotificationName:ARMSX2iOSRequestVMBoot object:nil];
-            [[NSNotificationCenter defaultCenter] postNotificationName:ARMSX2iOSAutoBootDidStart object:nil];
-        });
-    }
-#endif // DEBUG || TARGET_OS_SIMULATOR — AUTO_BOOT
-    // ps2autotests: auto-boot VM when ELF env var is set (always enabled)
-    if (getenv("ARMSX2_BOOT_ELF")) {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            [[NSNotificationCenter defaultCenter] postNotificationName:ARMSX2iOSRequestVMBoot object:nil];
-        });
-    }
-
-    NSSet<UIOpenURLContext *> *launchURLContexts = connectionOptions.URLContexts;
-    if (launchURLContexts.count > 0) {
-        dispatch_async(dispatch_get_main_queue(), ^{
-            for (UIOpenURLContext *ctx in launchURLContexts) {
-                NSLog(@"[ARMSX2 iOS DeepLink] cold-launch host=%@", ctx.URL.host);
-                [DeepLinkBridge handle:ctx.URL];
-            }
-        });
-    }
 }
 
 #pragma mark - Deep-link handling
@@ -481,10 +491,8 @@ std::atomic<bool> s_loadLastSaveStateOnBoot{false};
 }
 
 - (void)sceneDidEnterBackground:(UIScene *)scene {
-// Save NVM + memory cards when app goes to background.
-    // Without this, BIOS settings (language/date) are lost on every restart
-    // because cdvdSaveNVRAM() is only called at VM shutdown, which never
-    // happens when iOS terminates the app via SIGTERM.
+    // cdvdSaveNVRAM otherwise only runs at VM shutdown, which never comes when iOS kills the
+    // app, so BIOS settings (language, date) would be lost on every restart.
     if (s_vmThreadActive.load(std::memory_order_relaxed) && !BiosPath.empty()) {
         cdvdSaveNVRAM();
         Console.WriteLn("[NVM] NVM saved on sceneDidEnterBackground");

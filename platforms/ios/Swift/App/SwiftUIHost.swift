@@ -140,6 +140,10 @@ private extension UIKeyboardHIDUsage {
         default: nil
         }
     }
+
+    var isConfirmKey: Bool {
+        self == .keyboardReturnOrEnter || self == .keypadEnter || self == .keyboardSpacebar
+    }
 }
 
 /// A deliberately small bridge between UIKit presses and the SwiftUI-owned
@@ -151,6 +155,8 @@ final class ControllerEventDeliveryCoordinator {
     private weak var router: MenuControllerInputRouter?
     private(set) var rightStickScrolling = false
     private var menuActive = false
+    private var heldArrows: Set<MenuControllerCommand> = []
+    private var consumedConfirmKeys: Set<UIKeyboardHIDUsage> = []
 
     private init() {}
 
@@ -162,14 +168,21 @@ final class ControllerEventDeliveryCoordinator {
     /// focused NavigationLink takes a duplicate direction as activation on iPad.
     /// Keyboard arrows are bridged here, for Simulator and hardware keyboards.
     func handleMenuPressesEvent(_ presses: Set<UIPress>) -> Bool {
-        guard menuActive else { return false }
-        if let keyboardPress = presses.first(where: {
-            $0.key?.keyCode.menuControllerCommand != nil
-        }) {
-            if keyboardPress.phase == .began,
-               let command = keyboardPress.key?.keyCode.menuControllerCommand {
-                router?.handleKeyboardDirectionalPress(command)
+        let confirmed = handleConfirmPresses(presses)
+        guard menuActive else { return confirmed }
+        let keyboardPresses = presses.compactMap { press in
+            press.key?.keyCode.menuControllerCommand.map { (press.phase, $0) }
+        }
+        if !keyboardPresses.isEmpty {
+            // ARMSX2Application.sendEvent consumes the key-up, so the release is taken here.
+            for (phase, command) in keyboardPresses {
+                switch phase {
+                case .began: heldArrows.insert(command)
+                case .ended, .cancelled: heldArrows.remove(command)
+                default: break
+                }
             }
+            router?.handleKeyboardArrows(heldArrows)
             return true
         }
 
@@ -178,7 +191,25 @@ final class ControllerEventDeliveryCoordinator {
         // moved native focus and selected a SwiftUI NavigationLink while the
         // custom Settings graph was switching tabs. Profile-driven screens own
         // every such keyless controller press, so UIKit must not see the copy.
-        return presses.contains(where: { $0.key == nil })
+        return confirmed || presses.contains(where: { $0.key == nil })
+    }
+
+    /// A key-up goes where its key-down went, so UIKit never sees half a press.
+    private func handleConfirmPresses(_ presses: Set<UIPress>) -> Bool {
+        var consumed = false
+        for press in presses {
+            guard let key = press.key?.keyCode, key.isConfirmKey else { continue }
+            switch press.phase {
+            case .began:
+                guard router?.handleKeyboardActivate() == true else { continue }
+                consumedConfirmKeys.insert(key)
+                consumed = true
+            case .ended, .cancelled:
+                if consumedConfirmKeys.remove(key) != nil { consumed = true }
+            default: break
+            }
+        }
+        return consumed
     }
 
     func install(router: MenuControllerInputRouter) {
@@ -187,7 +218,10 @@ final class ControllerEventDeliveryCoordinator {
 
     func setMenuActive(_ active: Bool) {
         menuActive = active
-        if !active { rightStickScrolling = false }
+        if !active {
+            rightStickScrolling = false
+            heldArrows.removeAll()
+        }
     }
 
     func setRightStickScrolling(_ active: Bool) {

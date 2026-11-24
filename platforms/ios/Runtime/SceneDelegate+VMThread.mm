@@ -381,8 +381,6 @@ static void ARMSX2StartJITKeepalive()
                 std::string isoDir = EmuFolders::DataRoot + "/iso";
                 std::string defaultISO = "";
                 std::string isoFilename = Host::GetBaseStringSettingValue("GameISO", "BootISO", defaultISO.c_str());
-                Host::SetBaseStringSettingValue("GameISO", "BootISO", isoFilename.c_str());
-                Host::CommitBaseSettingChanges();
                 std::string isoPath = (!isoFilename.empty() && isoFilename.front() == '/') ? isoFilename : (isoDir + "/" + isoFilename);
                 // Fallback: check Documents/ root if not found in iso/.
                 if (!isoFilename.empty() && isoFilename.front() != '/' && !FileSystem::FileExists(isoPath.c_str())) {
@@ -470,8 +468,8 @@ static void ARMSX2StartJITKeepalive()
                 ARMSX2RepairIOSARM64JITSettings(s_settings_interface, "pre-vm-initialize");
                 ARMSX2MigrateJITScriptProtocolForIOS(s_settings_interface, "pre-vm-initialize");
                 ARMSX2IOSSanitizeFolderSettings(s_settings_interface, EmuFolders::DataRoot, "pre-vm-initialize");
+                VMManager::Internal::LoadStartupSettings();
             }
-            VMManager::Internal::LoadStartupSettings();
             ARMSX2ApplyIOSOsdPresetFromConfig("pre-vm-initialize");
             EmuConfig.Speedhacks.vuThread =
                 Host::GetBaseBoolSettingValue("EmuCore/Speedhacks", "vuThread", EmuConfig.Speedhacks.vuThread);

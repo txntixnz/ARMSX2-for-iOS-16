@@ -3,6 +3,7 @@
 
 import SwiftUI
 import AVKit
+import VideoToolbox
 
 /// Retains only the playhead for each configured local background video while
 /// iOS temporarily dismantles the inactive renderer. Gameplay teardown clears
@@ -43,9 +44,9 @@ private struct VideoBackgroundPlayer: UIViewRepresentable {
     func makeUIView(context: Context) -> LoopingVideoView { LoopingVideoView() }
     func updateUIView(_ uiView: LoopingVideoView, context: Context) { uiView.configure(url: url, muted: muted, fitMode: fitMode) }
 
-	static func dismantleUIView(_ uiView: LoopingVideoView, coordinator: ()) {
-		MainActor.assumeIsolated { uiView.teardown() }
-	}
+    static func dismantleUIView(_ uiView: LoopingVideoView, coordinator: ()) {
+        MainActor.assumeIsolated { uiView.teardown() }
+    }
 }
 
 private final class LoopingVideoView: UIView {
@@ -54,11 +55,13 @@ private final class LoopingVideoView: UIView {
     private var player: AVQueuePlayer?
     private var currentURL: URL?
     private var inactiveFrameView: UIImageView?
+    private var inactiveFrameOrientation = UIImage.Orientation.up
+    private var loopingItemsObservation: NSKeyValueObservation?
     private var releasedForGameplay = false
 
     deinit {
         MainActor.assumeIsolated {
-			teardown()
+            teardown()
         }
     }
 
@@ -79,7 +82,7 @@ private final class LoopingVideoView: UIView {
         // Recreate playback when the resolved source changes, including
         // orientation-specific assets.
         if player != nil, currentURL != url {
-			teardown()
+            teardown()
         }
 
         if player != nil {
@@ -94,6 +97,22 @@ private final class LoopingVideoView: UIView {
         queuePlayer.isMuted = muted
         queuePlayer.allowsExternalPlayback = false
         let looper = AVPlayerLooper(player: queuePlayer, templateItem: item)
+        // The looper plays replicas of the template, made once it is ready.
+        loopingItemsObservation = looper.observe(\.status, options: [.initial]) { @Sendable [weak self] _, _ in
+            Task { @MainActor in self?.attachVideoOutputs() }
+        }
+        // The output hands frames over as stored; the layer applies the track transform.
+        Task { @MainActor [weak self] in
+            let track = try? await AVURLAsset(url: url).loadTracks(withMediaType: .video).first
+            guard let transform = try? await track?.load(.preferredTransform),
+                  let self, currentURL == url else { return }
+            inactiveFrameOrientation = switch (transform.a, transform.b) {
+            case (_, 1): .right
+            case (_, -1): .left
+            case (-1, _): .down
+            default: .up
+            }
+        }
         let layer = AVPlayerLayer(player: queuePlayer)
         layer.videoGravity = gravity
         layer.backgroundColor = UIColor.clear.cgColor
@@ -105,7 +124,7 @@ private final class LoopingVideoView: UIView {
         layoutIfNeeded()
 
         NotificationCenter.default.addObserver(self, selector: #selector(pause), name: UIApplication.didEnterBackgroundNotification, object: nil)
-        NotificationCenter.default.addObserver(self, selector: #selector(captureInactiveFrame), name: UIApplication.willResignActiveNotification, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(captureInactiveFrame), name: UIScene.willDeactivateNotification, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(pause), name: UIScene.willDeactivateNotification, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(resumeIfReady), name: UIScene.didActivateNotification, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(releaseResourcesForGameplay), name: AppState.releaseMenuBackgroundResourcesNotification, object: nil)
@@ -127,7 +146,7 @@ private final class LoopingVideoView: UIView {
         }
     }
 
-	func teardown(preservePlaybackPosition: Bool = true) {
+    func teardown(preservePlaybackPosition: Bool = true) {
         if preservePlaybackPosition,
            let currentURL,
            let player {
@@ -139,12 +158,13 @@ private final class LoopingVideoView: UIView {
         player?.pause()
         NotificationCenter.default.removeObserver(self)
         playerLayer?.removeFromSuperlayer()
+        loopingItemsObservation = nil
         inactiveFrameView?.removeFromSuperview()
         inactiveFrameView = nil
         player = nil
         playerLooper = nil
         playerLayer = nil
-		currentURL = nil
+        currentURL = nil
     }
 
     @objc private func pause() {
@@ -156,10 +176,9 @@ private final class LoopingVideoView: UIView {
         guard UIApplication.shared.applicationState != .background, !ProcessInfo.processInfo.isLowPowerModeEnabled else { return }
         inactiveFrameView?.removeFromSuperview()
         inactiveFrameView = nil
-        // When this view remains mounted, AVQueuePlayer retains its current
-        // item time while paused. Do not restart it after a temporary pause
-        // such as Low Power Mode. A full inactive-scene teardown is handled by
-        // BackgroundContainerView and intentionally creates a new session.
+        // A paused AVQueuePlayer keeps its item time while this view stays mounted,
+        // so a temporary pause such as Low Power Mode resumes instead of restarting.
+        // A full inactive-scene teardown in BackgroundContainerView starts anew.
         player?.play()
     }
 
@@ -167,8 +186,9 @@ private final class LoopingVideoView: UIView {
     /// snapshot. Rasterize the current local-video frame into a normal UIImageView
     /// first so the persistent background host captures video just like image and
     /// dynamic backgrounds.
-    @objc private func captureInactiveFrame() {
-        guard let currentURL, let player, bounds.width > 0, bounds.height > 0 else {
+    @objc private func captureInactiveFrame(_ notification: Notification) {
+        guard notification.object as? UIScene === window?.windowScene,
+              let currentURL, let player, bounds.width > 0, bounds.height > 0 else {
             return
         }
         BackgroundVideoPlaybackPositionStore.shared.save(
@@ -176,21 +196,24 @@ private final class LoopingVideoView: UIView {
             for: currentURL
         )
 
-        let generator = AVAssetImageGenerator(asset: AVURLAsset(url: currentURL))
-        generator.appliesPreferredTrackTransform = true
-        generator.maximumSize = CGSize(
-            width: bounds.width * (window?.screen.scale ?? UIScreen.main.scale),
-            height: bounds.height * (window?.screen.scale ?? UIScreen.main.scale)
-        )
-        guard let image = try? generator.copyCGImage(
-            at: player.currentTime(),
-            actualTime: nil
-        ) else {
+        guard let output = player.currentItem?.outputs.lazy.compactMap({ $0 as? AVPlayerItemVideoOutput }).first,
+              let buffer = output.copyPixelBuffer(forItemTime: player.currentTime(), itemTimeForDisplay: nil) else {
             return
         }
-
+        var image: CGImage?
+        VTCreateCGImageFromCVPixelBuffer(buffer, options: nil, imageOut: &image)
+        guard let image else { return }
+        let decoded = UIImage(cgImage: image, scale: 1, orientation: inactiveFrameOrientation)
+        let fit = min(1, bounds.width * traitCollection.displayScale / decoded.size.width,
+                      bounds.height * traitCollection.displayScale / decoded.size.height)
+        let size = CGSize(width: (decoded.size.width * fit).rounded(), height: (decoded.size.height * fit).rounded())
+        let format = UIGraphicsImageRendererFormat.preferred()
+        format.scale = 1
+        let still = UIGraphicsImageRenderer(size: size, format: format).image { _ in
+            decoded.draw(in: CGRect(origin: .zero, size: size))
+        }
         inactiveFrameView?.removeFromSuperview()
-        let frameView = UIImageView(image: UIImage(cgImage: image))
+        let frameView = UIImageView(image: still)
         frameView.frame = bounds
         frameView.clipsToBounds = true
         switch playerLayer?.videoGravity {
@@ -203,6 +226,13 @@ private final class LoopingVideoView: UIView {
         }
         addSubview(frameView)
         inactiveFrameView = frameView
+        NotificationCenter.default.post(name: .captureMenuBackgroundSnapshot, object: self)
+    }
+
+    private func attachVideoOutputs() {
+        for item in playerLooper?.loopingPlayerItems ?? [] where item.outputs.isEmpty {
+            item.add(AVPlayerItemVideoOutput(outputSettings: nil))
+        }
     }
 
     @objc private func releaseResourcesForGameplay() {
@@ -214,12 +244,9 @@ private final class LoopingVideoView: UIView {
         }
     }
 
-    // Every other notification here is a UIKit lifecycle one and arrives on the main
-    // thread. This one does not: Foundation posts the power-state change from whatever
-    // queue it likes, and the body below touches UIKit and the player. The class is a
-    // UIView so it is main-actor isolated, which under Swift 6 means the @objc entry
-    // point checks the executor and traps before the body even runs. So take the hit
-    // off the main thread and hop, the way the seek handler above already does.
+    // Unlike the UIKit notifications here, Foundation posts the power-state change
+    // from any queue, and under Swift 6 a main-actor @objc entry traps off main. So
+    // take it nonisolated and hop, the way the seek handler above already does.
     @objc private nonisolated func adaptToPowerState() {
         Task { @MainActor [weak self] in
             self?.applyPowerState()
