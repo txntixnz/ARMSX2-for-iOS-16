@@ -16,6 +16,18 @@ struct VirtualPadLayoutSection: View {
 
     var body: some View {
         Section(settings.localized("Layout")) {
+            if let notice = unreadableFileNotice {
+                Label {
+                    Text(notice)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                } icon: {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundStyle(OverlayTheme.warm)
+                }
+            }
+
             controllerPicker(settings.localized("Default VPad Layout"), selection: Binding<String?>(
                 get: { layoutPresets.globalPresetID },
                 set: { layoutPresets.globalPresetID = $0 }
@@ -30,10 +42,10 @@ struct VirtualPadLayoutSection: View {
             .controllerAccessibilityActionTarget(id: settings.localized("Edit Layout"), label: settings.localized("Edit Layout")) {
                 showLayoutEditor = true
             }
-            Text(settings.localized("Drag buttons to reposition. Pinch to resize."))
+            Text(settings.localized("Drag buttons to move them. Pinch or drag the corner to resize."))
                 .font(.caption)
                 .foregroundStyle(.secondary)
-            Text("Simple custom pad skins are shown behind the blue hit boxes in Edit Layout. Advanced skin packages can include their own PS2 control layout metadata. Non-PS2 Delta/Manic skins are not converted automatically.")
+            Text(settings.localized("Simple custom pad skins show behind the buttons in Edit Layout. Advanced skin packages can include their own PS2 control layout. Non-PS2 Delta/Manic skins are not converted automatically."))
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
@@ -89,5 +101,15 @@ struct VirtualPadLayoutSection: View {
                 }
             }
         }
+    }
+
+    private var unreadableFileNotice: String? {
+        if let name = layoutPresets.setAsideName {
+            return String(format: settings.localized("Your layouts file couldn't be read. It was kept as %@, and layouts start fresh."), name)
+        }
+        if layoutPresets.readOnly {
+            return settings.localized("Your layouts file couldn't be read. Saved layouts can't be changed until the app restarts.")
+        }
+        return nil
     }
 }

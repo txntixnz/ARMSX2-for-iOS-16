@@ -64,7 +64,7 @@ struct VirtualControllerView: View {
             legacyThumbsticks: dynamicSettings.legacyThumbsticks,
             swipeCamera: dynamicSettings.swipeCamera,
             inputSessionGeneration: inputSessionGeneration,
-            inputZones: dynamicInputZones(w: w, h: h)
+            inputZones: dynamicInputZones(w: w, h: h, usesLayoutZones: false)
         )
     }
 
@@ -202,6 +202,30 @@ struct VirtualControllerView: View {
         let p = perButton ? perButtonPos(id, landscape: landscape, w: areaW, h: areaH) : pos(id, landscape: landscape)
         PadBtn(label: label, w: w, h: h, btn: btn, visibleScaleX: p.scaleX, visibleScaleY: p.scaleY, hitScaleX: p.hitScaleX, hitScaleY: p.hitScaleY)
             .position(x: p.x * areaW, y: p.y * areaH)
+            .opacity(p.opacity)
+    }
+
+    /// Each arrow shows on its own key, else the old editor's "dpad" group key. The 8-way surface needs
+    /// all four, as the face buttons' combo surface does; otherwise each shown arrow stands alone.
+    @ViewBuilder
+    private func placedDPad(landscape: Bool, areaW: CGFloat, areaH: CGFloat) -> some View {
+        let dpadW = VirtualPadButtonOffset.dpadButtonWidth(isLandscape: landscape)
+        if settings.controller.dpadDiagonalsEnabled && isVisible("up") && isVisible("down") && isVisible("left") && isVisible("right") {
+            placedCompositeDPad(landscape: landscape, areaW: areaW, areaH: areaH)
+        } else {
+            if isVisible("up") {
+                placedPadButton(id: "up", label: "▲", w: dpadW, h: dpadW, btn: .up, landscape: landscape, areaW: areaW, areaH: areaH, perButton: true)
+            }
+            if isVisible("down") {
+                placedPadButton(id: "down", label: "▼", w: dpadW, h: dpadW, btn: .down, landscape: landscape, areaW: areaW, areaH: areaH, perButton: true)
+            }
+            if isVisible("left") {
+                placedPadButton(id: "left", label: "◀", w: dpadW, h: dpadW, btn: .left, landscape: landscape, areaW: areaW, areaH: areaH, perButton: true)
+            }
+            if isVisible("right") {
+                placedPadButton(id: "right", label: "▶", w: dpadW, h: dpadW, btn: .right, landscape: landscape, areaW: areaW, areaH: areaH, perButton: true)
+            }
+        }
     }
 
     // 8-way D-pad for diagonals. Its capture circle and deadzone come from the four
@@ -226,7 +250,8 @@ struct VirtualControllerView: View {
                 visibleScaleX: p.scaleX,
                 visibleScaleY: p.scaleY,
                 hitScaleX: p.hitScaleX,
-                hitScaleY: p.hitScaleY
+                hitScaleY: p.hitScaleY,
+                opacity: p.opacity
             ))
         }
 
@@ -274,7 +299,8 @@ struct VirtualControllerView: View {
                 visibleScaleX: p.scaleX,
                 visibleScaleY: p.scaleY,
                 hitScaleX: p.hitScaleX,
-                hitScaleY: p.hitScaleY
+                hitScaleY: p.hitScaleY,
+                opacity: p.opacity
             ))
         }
 
@@ -310,6 +336,7 @@ struct VirtualControllerView: View {
         let p = perButtonPos(id, landscape: landscape, w: areaW, h: areaH)
         PSBtn(sym: sym, clr: clr, sz: sz, btn: btn, visibleScaleX: p.scaleX, visibleScaleY: p.scaleY, hitScaleX: p.hitScaleX, hitScaleY: p.hitScaleY)
             .position(x: p.x * areaW, y: p.y * areaH)
+            .opacity(p.opacity)
     }
 
     @ViewBuilder
@@ -321,7 +348,7 @@ struct VirtualControllerView: View {
         areaH: CGFloat
     ) -> some View {
         let p = pos(id, landscape: landscape)
-        if dynamicSettings.legacyThumbsticks && !(!isLeft && dynamicSettings.swipeCamera) {
+        if (p.floating.map { !$0 } ?? dynamicSettings.legacyThumbsticks) && !(!isLeft && dynamicSettings.swipeCamera) {
             let center = CGPoint(x: p.x * areaW, y: p.y * areaH)
             StickView(
                 isLeft: isLeft,
@@ -331,22 +358,41 @@ struct VirtualControllerView: View {
                 badgeScale: fitScale ?? 1
             )
             .position(center)
+            .opacity(p.opacity)
             .id(inputSessionGeneration)
         }
     }
 
+    /// A stick's stored mode wins; an unset stick follows the global Dynamic Thumbsticks setting.
+    private func stickFloats(_ isLeft: Bool, landscape: Bool) -> Bool {
+        pos(isLeft ? "lstick" : "rstick", landscape: landscape).floating ?? dynamicSettings.dynamicThumbsticks
+    }
+
+    private func floatingZone(_ isLeft: Bool, landscape: Bool, w: CGFloat, h: CGFloat) -> CGRect {
+        let share = pos(isLeft ? "lstick" : "rstick", landscape: landscape).zone ?? PadLayoutMetrics.defaultZone(isLeft: isLeft)
+        return CGRect(x: share.minX * w, y: share.minY * h, width: share.width * w, height: share.height * h)
+    }
+
+    // V2 skins keep the global flags and the halves.
     @ViewBuilder
-    private func dynamicInputZones(w: CGFloat, h: CGFloat) -> some View {
+    private func dynamicInputZones(w: CGFloat, h: CGFloat, usesLayoutZones: Bool) -> some View {
         let conversionSettings = dynamicSettings.effectiveSwipeConversionSettings
         let visualRadius = CGFloat(dynamicSettings.thumbstickRadius)
         let rightAreaScale = CGFloat(
             min(max(dynamicSettings.rightThumbstickAreaScale, 1), 5)
         )
+        let floats = { (isLeft: Bool) in
+            usesLayoutZones ? stickFloats(isLeft, landscape: isLandscape) : dynamicSettings.dynamicThumbsticks
+        }
+        let zone = { (isLeft: Bool) in
+            usesLayoutZones
+                ? floatingZone(isLeft, landscape: isLandscape, w: w, h: h)
+                : CGRect(x: isLeft ? 0 : w / 2, y: 0, width: w / 2, height: h)
+        }
+        let leftZone = zone(true), rightZone = zone(false)
         Group {
-            if dynamicSettings.dynamicThumbsticks && isVisible("lstick") {
-                dynamicThumbstickZone(isLeft: true)
-                    .frame(width: w / 2, height: h)
-                    .position(x: w / 4, y: h / 2)
+            if floats(true) && isVisible("lstick") {
+                floatingStick(isLeft: true, zone: leftZone, w: w, h: h, usesLayout: usesLayoutZones)
             }
 
             if dynamicSettings.swipeCamera && isVisible("rstick") {
@@ -410,18 +456,25 @@ struct VirtualControllerView: View {
                         }
                     }
                 )
-                .frame(width: w / 2, height: h)
-                .position(x: w * 0.75, y: h / 2)
-            } else if dynamicSettings.dynamicThumbsticks && isVisible("rstick") {
-                dynamicThumbstickZone(isLeft: false)
-                    .frame(width: w / 2, height: h)
-                    .position(x: w * 0.75, y: h / 2)
+                .frame(width: rightZone.width, height: rightZone.height)
+                .position(x: rightZone.midX, y: rightZone.midY)
+                .opacity(usesLayoutZones ? pos("rstick", landscape: isLandscape).opacity : 1)
+            } else if floats(false) && isVisible("rstick") {
+                floatingStick(isLeft: false, zone: rightZone, w: w, h: h, usesLayout: usesLayoutZones)
             }
         }
         .id(inputSessionGeneration)
     }
 
-    private func dynamicThumbstickZone(isLeft: Bool) -> some View {
+    private func floatingStick(isLeft: Bool, zone: CGRect, w: CGFloat, h: CGFloat, usesLayout: Bool) -> some View {
+        let p = pos(isLeft ? "lstick" : "rstick", landscape: isLandscape)
+        return dynamicThumbstickZone(isLeft: isLeft, home: usesLayout ? CGPoint(x: p.x * w - zone.minX, y: p.y * h - zone.minY) : nil)
+            .frame(width: zone.width, height: zone.height)
+            .position(x: zone.midX, y: zone.midY)
+            .opacity(usesLayout ? p.opacity : 1)
+    }
+
+    private func dynamicThumbstickZone(isLeft: Bool, home: CGPoint?) -> some View {
         let usesActions = isLeft
             ? dynamicSettings.leftThumbstickActionsEnabled
             : dynamicSettings.rightThumbstickActionsEnabled
@@ -453,6 +506,7 @@ struct VirtualControllerView: View {
             tapActionsEnabled: usesActions,
             maximumTapDuration: dynamicSettings.tapMaximumDuration,
             tapTravelTolerance: CGFloat(dynamicSettings.tapTravelTolerance),
+            home: home,
             onVector: { vector in
                 if isLeft {
                     EmulatorBridge.shared.setLeftStick(x: Float(vector.x), y: Float(vector.y))
@@ -522,19 +576,9 @@ struct VirtualControllerView: View {
                     .allowsHitTesting(false)
             }
 
-            dynamicInputZones(w: w, h: h)
+            dynamicInputZones(w: w, h: h, usesLayoutZones: true)
 
-            if isVisible("dpad") {
-                if settings.controller.dpadDiagonalsEnabled {
-                    placedCompositeDPad(landscape: true, areaW: w, areaH: h)
-                } else {
-                    let dpadW = VirtualPadButtonOffset.dpadButtonWidth(isLandscape: true)
-                    placedPadButton(id: "up", label: "▲", w: dpadW, h: dpadW, btn: .up, landscape: true, areaW: w, areaH: h, perButton: true)
-                    placedPadButton(id: "down", label: "▼", w: dpadW, h: dpadW, btn: .down, landscape: true, areaW: w, areaH: h, perButton: true)
-                    placedPadButton(id: "left", label: "◀", w: dpadW, h: dpadW, btn: .left, landscape: true, areaW: w, areaH: h, perButton: true)
-                    placedPadButton(id: "right", label: "▶", w: dpadW, h: dpadW, btn: .right, landscape: true, areaW: w, areaH: h, perButton: true)
-                }
-            }
+            placedDPad(landscape: true, areaW: w, areaH: h)
 
             // The combo surface needs all four face buttons visible; otherwise each button stands alone.
             if settings.controller.faceComboZonesEnabled,
@@ -580,6 +624,12 @@ struct VirtualControllerView: View {
             if isVisible("rstick") {
                 placedStick(id: "rstick", isLeft: false, landscape: true, areaW: w, areaH: h)
             }
+            if isVisible("l3") {
+                placedPadButton(id: "l3", label: "L3", w: 36, h: 36, btn: .L3, landscape: true, areaW: w, areaH: h)
+            }
+            if isVisible("r3") {
+                placedPadButton(id: "r3", label: "R3", w: 36, h: 36, btn: .R3, landscape: true, areaW: w, areaH: h)
+            }
         }
     }
 
@@ -598,7 +648,7 @@ struct VirtualControllerView: View {
                     .allowsHitTesting(false)
             }
 
-            dynamicInputZones(w: w, h: h)
+            dynamicInputZones(w: w, h: h, usesLayoutZones: true)
 
             GeometryReader { cGeo in
                 let cW = cGeo.size.width
@@ -623,17 +673,7 @@ struct VirtualControllerView: View {
                     placedPadButton(id: "start", label: "START", w: 48, h: 22, btn: .start, landscape: false, areaW: cW, areaH: cH)
                 }
 
-                if isVisible("dpad") {
-                    if settings.controller.dpadDiagonalsEnabled {
-                        placedCompositeDPad(landscape: false, areaW: cW, areaH: cH)
-                    } else {
-                        let dpadW = VirtualPadButtonOffset.dpadButtonWidth(isLandscape: false)
-                        placedPadButton(id: "up", label: "▲", w: dpadW, h: dpadW, btn: .up, landscape: false, areaW: cW, areaH: cH, perButton: true)
-                        placedPadButton(id: "down", label: "▼", w: dpadW, h: dpadW, btn: .down, landscape: false, areaW: cW, areaH: cH, perButton: true)
-                        placedPadButton(id: "left", label: "◀", w: dpadW, h: dpadW, btn: .left, landscape: false, areaW: cW, areaH: cH, perButton: true)
-                        placedPadButton(id: "right", label: "▶", w: dpadW, h: dpadW, btn: .right, landscape: false, areaW: cW, areaH: cH, perButton: true)
-                    }
-                }
+                placedDPad(landscape: false, areaW: cW, areaH: cH)
 
                 // The combo surface needs all four face buttons visible; otherwise each button stands alone.
                 if settings.controller.faceComboZonesEnabled,
@@ -660,6 +700,12 @@ struct VirtualControllerView: View {
                 }
                 if isVisible("rstick") {
                     placedStick(id: "rstick", isLeft: false, landscape: false, areaW: cW, areaH: cH)
+                }
+                if isVisible("l3") {
+                    placedPadButton(id: "l3", label: "L3", w: 36, h: 36, btn: .L3, landscape: false, areaW: cW, areaH: cH)
+                }
+                if isVisible("r3") {
+                    placedPadButton(id: "r3", label: "R3", w: 36, h: 36, btn: .R3, landscape: false, areaW: cW, areaH: cH)
                 }
             }
         }
