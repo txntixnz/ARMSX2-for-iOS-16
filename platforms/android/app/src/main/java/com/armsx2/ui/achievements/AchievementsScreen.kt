@@ -94,10 +94,17 @@ fun AchievementsScreen(onBack: () -> Unit, viewModel: AchievementsViewModel = vi
                                 contentScale = ContentScale.Crop,
                             )
                         }
-                        // Both totals: hardcore points (red) and softcore points (blue).
+                        // Both totals: hardcore points (red) and softcore points (blue), then
+                        // RetroPoints (white, as RA shows them) when a Web API key is set.
                         StatusChip("${state.score} HC", Danger)
                         StatusChip("${state.softcoreScore} SC")
-                        RoundAction("↻", str("games.card.refresh"), viewModel::refresh)
+                        val retroPoints = com.armsx2.RaLibrary.retroPoints.longValue
+                        LaunchedEffect(Unit) { com.armsx2.RaLibrary.refreshRetroPoints() }
+                        if (retroPoints >= 0) StatusChip("$retroPoints RetroPoints", Color.White)
+                        RoundAction("↻", str("games.card.refresh"), {
+                            viewModel.refresh()
+                            com.armsx2.RaLibrary.refreshRetroPoints(force = true)
+                        })
                     }
                 },
             )
@@ -655,6 +662,13 @@ private fun LibraryProgressSection() {
             shape = RoundedCornerShape(18.dp),
             modifier = Modifier.fillMaxWidth(),
         )
+        // RetroPoints come with the key: fetched once typing settles, no sync needed.
+        LaunchedEffect(key) {
+            if (key.isNotBlank()) {
+                kotlinx.coroutines.delay(1200)
+                com.armsx2.RaLibrary.refreshRetroPoints(force = true)
+            }
+        }
         Spacer(Modifier.height(8.dp))
         val sync = {
             if (!com.armsx2.RaLibrary.syncNow()) {

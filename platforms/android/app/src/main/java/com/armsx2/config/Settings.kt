@@ -597,6 +597,9 @@ data class OutputSettings(
     /** EmuCore/GS/CustomAspectRatio — width/height used when [aspectRatio] is 8 (Custom).
      *  A ratio rather than separate W/H so any value is expressible; clamped 0.5..5.0 natively. */
     val customAspectRatio: Float = 16f / 9f,
+    /** EmuCore/GS/StretchY — vertical stretch of the picture in percent (10..300, 100 = none).
+     *  With integer scaling it fills the height the whole-number scale leaves. A float natively. */
+    val stretchY: Int = 100,
     /** Host graphics API: "auto" / "opengl" / "vulkan" / "software". Applied via
      *  the renderer JNI helpers on (re)launch; per-game so each title can pick its
      *  own backend. Seeded from the legacy global "renderer" pref on first load.
@@ -776,6 +779,11 @@ data class GraphicsSettings(
      *  off regardless of the flag, and it's a no-op if this build has no librashader. */
     val shaderChainEnabled: Boolean = false,
     val shaderChainPreset: String = "",
+    /** EmuCore/GS/ShaderChainScale: the share of full size the chain runs at, in percent. The
+     *  game's picture is shrunk by it going in, and the chain's picture is scaled up from it to
+     *  the screen. 67 by default, about 0.44 of the pixels, which is what makes a heavy preset
+     *  playable on a phone GPU. The core's own default stays 100 for builds with no control for it. */
+    val shaderChainScale: Int = 67,
     /** EmuCore/GS/LsfgEnabled + /LsfgMultiplier + /LsfgDllPath — LSFG frame generation,
      *  inserted into the Vulkan present path. Off unless the user both enables it AND
      *  supplies their own Lossless.dll: the interpolation shaders are read out of that
@@ -1531,6 +1539,7 @@ data class Settings(
                 upscaleFloat = floatAt("EmuCore/GS/upscale_multiplier") ?: this.output.upscaleFloat,
                 // ---- EmuCore/GS (writeGsToNative). Aspect/FMV/gpuProfile stored as names. ----
                 customAspectRatio = floatAt("EmuCore/GS/CustomAspectRatio") ?: this.output.customAspectRatio,
+                stretchY = floatAt("EmuCore/GS/StretchY")?.let { Math.round(it).coerceIn(10, 300) } ?: this.output.stretchY,
                 aspectRatio = when (strAt("EmuCore/GS/AspectRatio")) {
                 "Stretch" -> 0
                 "Auto 4:3/3:2" -> 1
@@ -1627,6 +1636,7 @@ data class Settings(
                 fxaa = boolAt("EmuCore/GS/fxaa") ?: this.graphics.fxaa,
                 shaderChainEnabled = boolAt("EmuCore/GS/ShaderChainEnabled") ?: this.graphics.shaderChainEnabled,
                 shaderChainPreset = strAt("EmuCore/GS/ShaderChainPreset") ?: this.graphics.shaderChainPreset,
+                shaderChainScale = intAt("EmuCore/GS/ShaderChainScale") ?: this.graphics.shaderChainScale,
                 lsfgEnabled = boolAt("EmuCore/GS/LsfgEnabled") ?: this.graphics.lsfgEnabled,
                 lsfgMultiplier = intAt("EmuCore/GS/LsfgMultiplier") ?: this.graphics.lsfgMultiplier,
                 lsfgDllPath = strAt("EmuCore/GS/LsfgDllPath") ?: this.graphics.lsfgDllPath,
@@ -1786,6 +1796,7 @@ data class Settings(
         }
         put("EmuCore/GS", "FMVAspectRatioSwitch", "string", fmvAspectRatioName)
         put("EmuCore/GS", "CustomAspectRatio", "float", output.customAspectRatio.coerceIn(0.5f, 5.0f).toString())
+        put("EmuCore/GS", "StretchY", "float", output.stretchY.coerceIn(10, 300).toString())
         put("EmuCore/GS", "deinterlace_mode", "int", output.deinterlaceMode.coerceIn(0, 9).toString())
         put("EmuCore/GS", "FramerateNTSC", "float", output.framerateNtsc.toString())
         put("EmuCore/GS", "FrameratePAL", "float", output.frameratePal.toString())
@@ -1807,6 +1818,7 @@ data class Settings(
         put("EmuCore/GS", "fxaa", "bool", graphics.fxaa.toString())
         put("EmuCore/GS", "ShaderChainEnabled", "bool", graphics.shaderChainEnabled.toString())
         put("EmuCore/GS", "ShaderChainPreset", "string", graphics.shaderChainPreset)
+        put("EmuCore/GS", "ShaderChainScale", "int", graphics.shaderChainScale.coerceIn(25, 100).toString())
         put("EmuCore/GS", "LsfgEnabled", "bool", graphics.lsfgEnabled.toString())
         put("EmuCore/GS", "LsfgMultiplier", "int", graphics.lsfgMultiplier.toString())
         put("EmuCore/GS", "LsfgDllPath", "string", graphics.lsfgDllPath)
@@ -2110,6 +2122,7 @@ data class Settings(
         put("aspectRatio", output.aspectRatio)
         put("fmvAspectRatio", output.fmvAspectRatio)
         put("customAspectRatio", output.customAspectRatio.toDouble())
+        put("stretchY", output.stretchY)
         put("deinterlaceMode", output.deinterlaceMode)
         put("dev9EthEnable", network.dev9EthEnable)
         put("dev9EthApi", network.dev9EthApi)
@@ -2174,6 +2187,7 @@ data class Settings(
         put("fxaa", graphics.fxaa)
         put("shaderChainEnabled", graphics.shaderChainEnabled)
         put("shaderChainPreset", graphics.shaderChainPreset)
+        put("shaderChainScale", graphics.shaderChainScale)
         put("shaderChainParams", shaderChainParamsToJson(graphics.shaderChainParams))
         // These five were missing from the JSON round-trip entirely, which IS the persistence
         // format — so every LSFG choice, the imported DLL path included, was thrown away the
@@ -2519,6 +2533,7 @@ data class Settings(
                     aspectRatio = json.optInt("aspectRatio", def.output.aspectRatio),
                     fmvAspectRatio = json.optInt("fmvAspectRatio", def.output.fmvAspectRatio),
                     customAspectRatio = json.optDouble("customAspectRatio", def.output.customAspectRatio.toDouble()).toFloat(),
+                    stretchY = json.optInt("stretchY", def.output.stretchY),
                     deinterlaceMode = json.optInt("deinterlaceMode", def.output.deinterlaceMode),
                 ),
                 network = NetworkSettings(
@@ -2581,6 +2596,7 @@ data class Settings(
                     fxaa = json.optBoolean("fxaa", def.graphics.fxaa),
                     shaderChainEnabled = json.optBoolean("shaderChainEnabled", def.graphics.shaderChainEnabled),
                     shaderChainPreset = json.optString("shaderChainPreset", def.graphics.shaderChainPreset),
+                    shaderChainScale = json.optInt("shaderChainScale", def.graphics.shaderChainScale),
                     shaderChainParams = json.optJSONObject("shaderChainParams")
                     ?.let { shaderChainParamsFromJson(it) } ?: def.graphics.shaderChainParams,
                     lsfgEnabled = json.optBoolean("lsfgEnabled", def.graphics.lsfgEnabled),
@@ -2768,6 +2784,7 @@ data class Settings(
             if (current.output.aspectRatio         != base.output.aspectRatio)         j.put("aspectRatio", current.output.aspectRatio)
             if (current.output.fmvAspectRatio      != base.output.fmvAspectRatio)      j.put("fmvAspectRatio", current.output.fmvAspectRatio)
             if (current.output.customAspectRatio   != base.output.customAspectRatio)   j.put("customAspectRatio", current.output.customAspectRatio.toDouble())
+            if (current.output.stretchY            != base.output.stretchY)            j.put("stretchY", current.output.stretchY)
             if (current.output.deinterlaceMode     != base.output.deinterlaceMode)     j.put("deinterlaceMode", current.output.deinterlaceMode)
             if (current.network.dev9EthEnable       != base.network.dev9EthEnable)       j.put("dev9EthEnable", current.network.dev9EthEnable)
             if (current.network.dev9EthApi          != base.network.dev9EthApi)          j.put("dev9EthApi", current.network.dev9EthApi)
@@ -2834,6 +2851,7 @@ data class Settings(
             if (current.graphics.fxaa                != base.graphics.fxaa)                j.put("fxaa", current.graphics.fxaa)
             if (current.graphics.shaderChainEnabled  != base.graphics.shaderChainEnabled)  j.put("shaderChainEnabled", current.graphics.shaderChainEnabled)
             if (current.graphics.shaderChainPreset   != base.graphics.shaderChainPreset)   j.put("shaderChainPreset", current.graphics.shaderChainPreset)
+            if (current.graphics.shaderChainScale    != base.graphics.shaderChainScale)    j.put("shaderChainScale", current.graphics.shaderChainScale)
             if (current.graphics.shaderChainParams   != base.graphics.shaderChainParams)   j.put("shaderChainParams", shaderChainParamsToJson(current.graphics.shaderChainParams))
             if (current.graphics.lsfgEnabled         != base.graphics.lsfgEnabled)         j.put("lsfgEnabled", current.graphics.lsfgEnabled)
             if (current.graphics.lsfgMultiplier      != base.graphics.lsfgMultiplier)      j.put("lsfgMultiplier", current.graphics.lsfgMultiplier)
@@ -3112,6 +3130,7 @@ data class Settings(
                 aspectRatio = if (overrides.has("aspectRatio")) overrides.getInt("aspectRatio") else base.output.aspectRatio,
                 fmvAspectRatio = if (overrides.has("fmvAspectRatio")) overrides.getInt("fmvAspectRatio") else base.output.fmvAspectRatio,
                 customAspectRatio = if (overrides.has("customAspectRatio")) overrides.getDouble("customAspectRatio").toFloat() else base.output.customAspectRatio,
+                stretchY = if (overrides.has("stretchY")) overrides.getInt("stretchY") else base.output.stretchY,
                 deinterlaceMode = if (overrides.has("deinterlaceMode")) overrides.getInt("deinterlaceMode") else base.output.deinterlaceMode,
             ),
             network = NetworkSettings(
@@ -3180,6 +3199,7 @@ data class Settings(
                 fxaa = if (overrides.has("fxaa")) overrides.getBoolean("fxaa") else base.graphics.fxaa,
                 shaderChainEnabled = if (overrides.has("shaderChainEnabled")) overrides.getBoolean("shaderChainEnabled") else base.graphics.shaderChainEnabled,
                 shaderChainPreset = if (overrides.has("shaderChainPreset")) overrides.getString("shaderChainPreset") else base.graphics.shaderChainPreset,
+                shaderChainScale = if (overrides.has("shaderChainScale")) overrides.getInt("shaderChainScale") else base.graphics.shaderChainScale,
             // Replaces the global map wholesale rather than merging per parameter: a
             // per-game tweak means "this game's chain looks like THIS", and merging would
             // let a later global edit leak into a game the user had already dialled in.

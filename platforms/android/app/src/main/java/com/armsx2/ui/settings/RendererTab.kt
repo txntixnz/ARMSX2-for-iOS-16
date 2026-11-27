@@ -276,6 +276,19 @@ fun RendererTab(state: MutableState<Settings>) {
                     field = "customAspectRatio",
                 )
             }
+            // Vertical Stretch: with integer scaling and a wide ratio, fills the height the
+            // whole-number scale leaves, keeping the sharp scaling.
+            IntSliderRow(
+                label = str("renderer.stretchY.label"),
+                value = s.output.stretchY.coerceIn(10, 300),
+                min = 10,
+                max = 300,
+                description = str("renderer.stretchY.description"),
+                valueFormatter = { "$it%" },
+                onReset = if (s.output.stretchY != 100) { { apply(s.copy(output = s.output.copy(stretchY = 100))) } } else null,
+                onChange = { apply(s.copy(output = s.output.copy(stretchY = it))) },
+                field = "stretchY",
+            )
             SettingsDivider()
             // FMV Aspect Ratio override — applies only during FMVs/cutscenes; "Off" keeps
             // the aspect above. Handy for games that render FMVs at a different ratio.
@@ -616,6 +629,8 @@ fun RendererTab(state: MutableState<Settings>) {
                 onEnabledChange = { apply(s.copy(graphics = s.graphics.copy(shaderChainEnabled = it))) },
                 onPresetChange = { apply(s.copy(graphics = s.graphics.copy(shaderChainPreset = it))) },
                 onParamsChange = { apply(s.copy(graphics = s.graphics.copy(shaderChainParams = it))) },
+                scale = s.graphics.shaderChainScale,
+                onScaleChange = { apply(s.copy(graphics = s.graphics.copy(shaderChainScale = it))) },
             )
             SettingsDivider()
             // Where the presets above come from. Not a setting — it only puts files in

@@ -53,6 +53,33 @@ object RaLibrary {
     private class Catalog(val hashToGame: Map<String, Int>, val gameToTotal: Map<Int, Int>)
 
     val syncing = androidx.compose.runtime.mutableStateOf(false)
+
+    private const val KEY_RETRO_POINTS = "ra.retroPoints"
+    /** The player's RetroPoints (RA's "true" points, weighted by how rare each unlock is), which
+     *  only the Web API reports. -1 until known; the last value fetched is kept for the next
+     *  start, so it shows before a new fetch answers. */
+    val retroPoints = androidx.compose.runtime.mutableLongStateOf(-1L)
+    @Volatile private var retroPointsAt = 0L
+
+    /** Fetches RetroPoints when a Web API key is set; at most once a minute unless [force]. */
+    fun refreshRetroPoints(force: Boolean = false) {
+        if (retroPoints.longValue < 0) {
+            retroPoints.longValue = runCatching { MainActivityRuntime.prefs.getLong(KEY_RETRO_POINTS, -1L) }.getOrDefault(-1L)
+        }
+        if (!configured()) return
+        val now = System.currentTimeMillis()
+        if (!force && now - retroPointsAt < 60_000L) return
+        retroPointsAt = now
+        val key = webApiKey
+        val user = userName
+        kotlin.concurrent.thread(isDaemon = true, name = "ra-retro-points") {
+            val body = get("$API/API_GetUserProfile.php?u=${enc(user)}&y=${enc(key)}") ?: return@thread
+            val points = runCatching { JSONObject(body).optLong("TotalTruePoints", -1L) }.getOrDefault(-1L)
+            if (points < 0) return@thread
+            runCatching { MainActivityRuntime.prefs.edit().putLong(KEY_RETRO_POINTS, points).apply() }
+            android.os.Handler(android.os.Looper.getMainLooper()).post { retroPoints.longValue = points }
+        }
+    }
     val lastResult = androidx.compose.runtime.mutableStateOf("")
 
     var webApiKey: String
@@ -86,31 +113,47 @@ object RaLibrary {
      * navigation, and set sizes change on the order of weeks.
      */
     fun onLibraryLoaded(games: List<GameInfo>, force: Boolean = false) {
-        lastKnownGames = games.mapNotNull { g ->
-            val serial = g.serial?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
-            val path = runCatching { DiscIdentity.nativePath(g.uri) }.getOrNull()
-                ?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
-            path to serial
-        }
+        lastKnownGames = pathsAndSerials(games)
         if (!configured() || lastKnownGames.isEmpty()) return
         val last = runCatching { MainActivityRuntime.prefs.getLong(KEY_LAST_SYNC, 0L) }.getOrDefault(0L)
         if (!force && (System.currentTimeMillis() - last) < SYNC_MIN_INTERVAL_MS) return
         syncInBackground()
     }
 
-    /** Manual "sync now" — ignores the interval. Returns false when there is nothing to do. */
+    private fun pathsAndSerials(games: List<GameInfo>): List<Pair<String, String>> = games.mapNotNull { g ->
+        val serial = g.serial?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
+        val path = runCatching { DiscIdentity.nativePath(g.uri) }.getOrNull()
+            ?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
+        path to serial
+    }
+
+    /** Manual "sync now", which ignores the interval and fetches RetroPoints too. False when it
+     *  cannot run: not signed in, or no key. A library not handed over yet this run (the library
+     *  screen does once the core is up) comes from the last scan's cached list. */
     fun syncNow(): Boolean {
-        if (!configured() || lastKnownGames.isEmpty()) return false
-        syncInBackground()
+        if (!configured()) return false
+        refreshRetroPoints(force = true)
+        syncInBackground(useCachedLibrary = true)
         return true
     }
 
-    private fun syncInBackground() {
+    private fun syncInBackground(useCachedLibrary: Boolean = false) {
         if (syncing.value) return
         val context = MainActivityRuntime.instance?.applicationContext ?: return
-        val games = lastKnownGames
         syncing.value = true
         kotlin.concurrent.thread(isDaemon = true, name = "ra-library-sync") {
+            if (useCachedLibrary && lastKnownGames.isEmpty()) {
+                lastKnownGames = pathsAndSerials(
+                    runCatching { com.armsx2.data.library.GameLibraryRepository(context).loadCached().games }
+                        .getOrDefault(emptyList()),
+                )
+            }
+            val games = lastKnownGames
+            if (games.isEmpty()) {
+                lastResult.value = com.armsx2.i18n.I18n.get("ra.library.notReady")
+                syncing.value = false
+                return@thread
+            }
             val result = runCatching { sync(context, games, userName) }
                 .getOrElse { it.message ?: "sync failed" }
             runCatching {
